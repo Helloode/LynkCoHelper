@@ -1,0 +1,48 @@
+# 每日自动执行领克App签到 + 分享，并通过 Bark 推送结果。
+# 敏感字段（账号 token/deviceId、应用签名密钥、Bark key）均通过仓库 Secrets
+# 提供，代码中不含任何默认值，未配置会直接报错退出，获取方式见 readme.md。
+# 说明：
+#   - 登录环节存在滑块验证码，无法在 CI 中完全自动化，本工作流依赖
+#     refreshToken 自动续期获取 token（约30天有效，需定期人工更新）。
+#   - LYNKCO_APP_SECRETS 是领克官方 App 的应用级共用签名密钥集合
+#     （非个人账号凭证），一个 JSON 字符串 Secret 整合了原本 8 个
+#     独立字段，必须配置，否则脚本无法计算请求签名，结构详见 readme.md。
+
+name: LynkCoHelperRunner
+
+on:
+  schedule:
+    # 每天北京时间 1:00 执行 (UTC 前一天 17:00)
+    - cron: "0 17 * * *"
+  workflow_dispatch:
+
+jobs:
+  sign:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: CheckOut
+      uses: actions/checkout@v4
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f ./LynkCoHelper/requirements.txt ]; then pip install -r ./LynkCoHelper/requirements.txt; fi
+    - name: Run sign-in and notify
+      env:
+        # refreshToken 自动续期获取 token，详见 lynkco_login.load_token()
+        LYNKCO_REFRESH_TOKEN: ${{ secrets.LYNKCO_REFRESH_TOKEN }}
+        LYNKCO_DEVICE_ID: ${{ secrets.LYNKCO_DEVICE_ID }}
+        # Bark 推送 key，详见 lynkco_notify.py
+        LYNKCO_BARK_KEY: ${{ secrets.LYNKCO_BARK_KEY }}
+        # App 共用签名密钥集合（JSON 字符串，详见 lynkco_common.py），必须配置，
+        # 否则脚本会在计算签名时报错退出。字段名与 env.json 的 secrets 段一致：
+        # {"h5AppKey":"","h5AppSecret":"","nativeAppKey":"","nativeAppSecret":"",
+        #  "nativeAppCode":"","loginAppCode":"","deviceImei":"","glDevId":""}
+        LYNKCO_APP_SECRETS: ${{ secrets.LYNKCO_APP_SECRETS }}
+      run: |
+        python ./LynkCoHelper/lynkco_daily_tasks.py
