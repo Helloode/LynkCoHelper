@@ -11,7 +11,6 @@ do_share() 已封装好"优先简化两步法，失败/无 content_id 时可选�
 也可直接运行本文件单独触发一次分享。
 """
 import json
-import random
 import sys
 import time
 
@@ -40,7 +39,7 @@ EP_SHARE_REPORTING_SIMPLE = "/app/v1/task/shareReporting"
 # dynamicSort/uniqueId/refreshType/pageNo 分页参数（抓包自原生请求，H5签名不覆盖
 # body 故可直接复用），否则只返回首屏、命中"文章"类型的概率很低。
 EP_EXPLORE_SQUARE_INDEX = "/app/explore/home-page/square/index2"
-# get_latest_article() 翻页汇总候选文章的页数。
+# get_latest_article() 命中第一篇文章前最多尝试翻的页数。
 EXPLORE_SQUARE_PAGE_COUNT = 2
 
 # 分享落地页 H5 域名（与签到用的 h5.lynkco.cn 是两个不同域名/Origin，
@@ -51,18 +50,23 @@ H5_SHARE_ORIGIN = "https://h5.lynkco.com"
 DEFAULT_SHARE_ARTICLE_ID = "2075054309774663680"
 
 
-def _collect_articles(value, out: list) -> None:
-    """递归收集广场文章流中所有“文章”类型内容的 {"articleId", "title"}，结果追加到 out。"""
+def _find_article(value) -> dict:
+    """递归查找广场文章流中第一个“文章”类型内容，返回 {"articleId", "title"}，未找到则返回空 dict。"""
     if isinstance(value, dict):
         article_id = value.get("articleId")
         content_type = value.get("contentType") or value.get("contentTypeCode")
         if article_id and (not content_type or content_type in ("文章", "article")):
-            out.append({"articleId": str(article_id), "title": str(value.get("title") or "")})
+            return {"articleId": str(article_id), "title": str(value.get("title") or "")}
         for child in value.values():
-            _collect_articles(child, out)
+            found = _find_article(child)
+            if found:
+                return found
     elif isinstance(value, list):
         for item in value:
-            _collect_articles(item, out)
+            found = _find_article(item)
+            if found:
+                return found
+    return {}
 
 
 class LynkCoShareClient:
@@ -122,22 +126,17 @@ class LynkCoShareClient:
         return resp
 
     def get_latest_article(self) -> dict:
-        """翻页汇总探索广场的候选文章，随机取一篇 {"articleId", "title"}，失败/未找到时返回空 dict。"""
-        candidates = []
-        seen_ids = set()
+        """翻页查找探索广场文章流，命中第一篇“文章”即返回 {"articleId", "title"}，失败/未找到时返回空 dict。"""
         for page_no in range(1, EXPLORE_SQUARE_PAGE_COUNT + 1):
             try:
                 body = {"dynamicSort": "new", "uniqueId": "", "refreshType": "MORE", "pageNo": page_no}
                 resp = self._request("POST", EP_EXPLORE_SQUARE_INDEX, json=body)
-                page_articles = []
-                _collect_articles(resp.json(), page_articles)
-                for article in page_articles:
-                    if article["articleId"] not in seen_ids:
-                        seen_ids.add(article["articleId"])
-                        candidates.append(article)
+                found = _find_article(resp.json())
+                if found:
+                    return found
             except Exception:
                 continue
-        return random.choice(candidates) if candidates else {}
+        return {}
 
     def get_share_code(self, article_id: str = None, account_id: str = None) -> dict:
         """
