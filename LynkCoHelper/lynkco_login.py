@@ -130,10 +130,12 @@ def refresh_token(refresh_token_value: str, device_id: str) -> dict:
 
 
 def _save_refreshed_token(refreshed: dict) -> None:
-    """续期成功后，把最新的 token/refreshToken 回写 env.json，便于排查和留档。"""
+    """续期成功后，把最新的 token/refreshToken/expireAt 回写 env.json，便于排查、留档及本地缓存判断。"""
     fields = {"token": refreshed["token"]}
     if refreshed.get("refreshToken"):
         fields["refreshToken"] = refreshed["refreshToken"]
+    if refreshed.get("expireAt"):
+        fields["tokenExpireAt"] = refreshed["expireAt"]
     save_env_fields(fields)
 
 
@@ -397,15 +399,41 @@ def login_with_geetest_and_sms(mobile: str, verification_code: str,
 
 # ------------------------- 统一 token 获取入口 -------------------------
 
+# 本地缓存的 token 距过期时间小于该阈值(秒)时视为已失效，提前触发续期，避免请求发出后 token 恰好过期。
+TOKEN_CACHE_SAFETY_MARGIN_SEC = 60
+
+
+def _cached_token_valid(user_data: dict) -> str:
+    """若 env.json 中缓存的 token 距 tokenExpireAt 仍有余量，返回该 token；已过期/缺失时返回空字符串。"""
+    token = user_data.get("token")
+    expire_at = user_data.get("tokenExpireAt")
+    if not token or not expire_at:
+        return ""
+    try:
+        remain_sec = (float(expire_at) - time.time() * 1000) / 1000
+    except (TypeError, ValueError):
+        return ""
+    if remain_sec > TOKEN_CACHE_SAFETY_MARGIN_SEC:
+        print(f"[信息] 命中本地缓存 token，距过期还剩约 {int(remain_sec)} 秒，跳过 refreshToken 续期请求。")
+        return token.strip()
+    return ""
+
 
 def load_token() -> str:
     """
     token 获取优先级：
-        1. 环境变量 LYNKCO_REFRESH_TOKEN + LYNKCO_DEVICE_ID，或 env.json
-           user.refreshToken + user.deviceId —— 自动向网关换取最新 token；
-        2. 环境变量 LYNKCO_TOKEN 或 env.json 的 user.token（静态兜底）。
+        1. env.json 中缓存的 token 若未过期（留 60 秒安全余量），直接复用，调试时避免
+           频繁调用续期接口；
+        2. 环境变量 LYNKCO_REFRESH_TOKEN + LYNKCO_DEVICE_ID，或 env.json
+           user.refreshToken + user.deviceId —— 自动向网关换取最新 token（成功后
+           会把 token/expireAt 写回 env.json 供下次复用）；
+        3. 环境变量 LYNKCO_TOKEN 或 env.json 的 user.token（静态兜底）。
     """
     user_data = load_env_data().get("user", {})
+
+    cached = _cached_token_valid(user_data)
+    if cached:
+        return cached
 
     refresh_token_value = os.environ.get("LYNKCO_REFRESH_TOKEN") or user_data.get("refreshToken")
     device_id = os.environ.get("LYNKCO_DEVICE_ID") or user_data.get("deviceId")

@@ -6,7 +6,8 @@
 
 env.json 结构（三个子对象）：
     {
-      "user": {"username": "", "password": "", "token": "", "refreshToken": "", "deviceId": ""},
+      "user": {"username": "", "password": "", "token": "", "refreshToken": "", "deviceId": "",
+                "tokenExpireAt": ""},
       "secrets": {"h5AppKey": "", "h5AppSecret": "", "nativeAppKey": "", "nativeAppSecret": "",
                   "nativeAppCode": "", "loginAppCode": "", "deviceImei": "", "glDevId": ""},
       "notify": {"barkKey": ""}
