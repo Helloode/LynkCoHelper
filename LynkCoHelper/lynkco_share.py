@@ -126,16 +126,23 @@ class LynkCoShareClient:
         return resp
 
     def get_latest_article(self) -> dict:
-        """翻页查找探索广场文章流，命中第一篇“文章”即返回 {"articleId", "title"}，失败/未找到时返回空 dict。"""
+        """翻页查找探索广场文章流，命中第一篇"文章"即返回 {"articleId", "title"}，失败/未找到时返回空 dict 并打印警告日志。"""
         for page_no in range(1, EXPLORE_SQUARE_PAGE_COUNT + 1):
             try:
                 body = {"dynamicSort": "new", "uniqueId": "", "refreshType": "MORE", "pageNo": page_no}
                 resp = self._request("POST", EP_EXPLORE_SQUARE_INDEX, json=body)
-                found = _find_article(resp.json())
+                resp_json = resp.json()
+                found = _find_article(resp_json)
                 if found:
                     return found
-            except Exception:
+                print(
+                    f"[警告] get_latest_article: 第 {page_no} 页未命中\"文章\"类型内容，"
+                    f"接口返回 code={resp_json.get('code')!r}"
+                )
+            except Exception as e:
+                print(f"[警告] get_latest_article: 第 {page_no} 页请求异常: {e}")
                 continue
+        print(f"[警告] get_latest_article: 翻完 {EXPLORE_SQUARE_PAGE_COUNT} 页仍未找到文章，将回退到 DEFAULT_SHARE_ARTICLE_ID")
         return {}
 
     def get_share_code(self, article_id: str = None, account_id: str = None) -> dict:
@@ -248,6 +255,10 @@ class LynkCoShareClient:
             latest = self.get_latest_article()
             article_id = latest.get("articleId") or DEFAULT_SHARE_ARTICLE_ID
             article_title = latest.get("title", "")
+            if latest and not article_title:
+                print(f"[警告] do_share: 动态获取到文章 articleId={article_id}，但该内容节点的 title 字段为空")
+            elif not latest:
+                print(f"[警告] do_share: 未获取到动态文章，回退使用 DEFAULT_SHARE_ARTICLE_ID={article_id}")
 
         if use_simple:
             try:
