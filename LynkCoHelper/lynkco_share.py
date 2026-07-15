@@ -90,6 +90,13 @@ class LynkCoShareClient:
         headers.update(kwargs.pop("extra_headers", {}))
         url = BASE_URL + path
         resp = self.session.request(method, url, headers=headers, timeout=15, **kwargs)
+        try:
+            resp.json()
+        except ValueError:
+            print(
+                f"[警告][H5 {method} {path}] 接口未返回有效 JSON，HTTP {resp.status_code}，"
+                f"X-Ca-Key={sig_headers.get('X-Ca-Key')!r}，响应体前200字符: {resp.text[:200]!r}"
+            )
         return resp
 
     def _native_request(self, method: str, path: str, extra_headers: dict = None, **kwargs) -> requests.Response:
@@ -123,6 +130,13 @@ class LynkCoShareClient:
             headers.update(extra_headers)
         url = BASE_URL + path
         resp = self.session.request(method, url, headers=headers, timeout=15, **kwargs)
+        try:
+            resp.json()
+        except ValueError:
+            print(
+                f"[警告][Native {method} {path}] 接口未返回有效 JSON，HTTP {resp.status_code}，"
+                f"x-ca-key={sig_headers.get('x-ca-key')!r}，响应体前200字符: {resp.text[:200]!r}"
+            )
         return resp
 
     def get_latest_article(self) -> dict:

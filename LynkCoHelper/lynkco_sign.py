@@ -43,8 +43,9 @@ class LynkCoSignClient:
             resp.json()
         except ValueError:
             raise RuntimeError(
-                f"接口未返回有效 JSON（可能被网关拦截，如境外 IP 访问限制），"
-                f"HTTP {resp.status_code}，响应体前200字符: {resp.text[:200]!r}"
+                f"[{method} {path}] 接口未返回有效 JSON（可能被网关拦截，如境外 IP 访问限制"
+                f"或 AppKey 未授权），HTTP {resp.status_code}，X-Ca-Key={sig_headers.get('X-Ca-Key')!r}，"
+                f"响应体前200字符: {resp.text[:200]!r}"
             )
         return resp
 
