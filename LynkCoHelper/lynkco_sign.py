@@ -39,6 +39,13 @@ class LynkCoSignClient:
         headers.update(kwargs.pop("extra_headers", {}))
         url = BASE_URL + path
         resp = self.session.request(method, url, headers=headers, timeout=15, **kwargs)
+        try:
+            resp.json()
+        except ValueError:
+            raise RuntimeError(
+                f"接口未返回有效 JSON（可能被网关拦截，如境外 IP 访问限制），"
+                f"HTTP {resp.status_code}，响应体前200字符: {resp.text[:200]!r}"
+            )
         return resp
 
     def get_sign_day_info(self) -> dict:
