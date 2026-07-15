@@ -19,7 +19,6 @@
 
 - [ ] 账号密码登录（`login_by_password`）：仅为参考实现，密码加密算法未完全逆向确认，且陌生设备会被风控拦截，不建议依赖
 - [ ] 分享任务仅支持"文章"类型内容，"动态"类型的正确分享链接格式尚未验证
-- [ ] iOS 设备直接抓包获取 token：因 App 存在 SSL Pinning 无法支持，需使用 Android 模拟器/真机
 - [ ] 登录滑块验证码全自动化：极验人机验证无法自动完成，仍需人工操作一次
 
 详细说明（配置方式、token 获取、部署步骤等）见 [`LynkCoHelper/readme.md`](LynkCoHelper/readme.md)。
