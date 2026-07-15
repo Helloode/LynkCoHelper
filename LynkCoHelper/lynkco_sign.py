@@ -4,14 +4,33 @@
 
 使用前提：需要有效 token，由 lynkco_login.py 的 load_token() 统一提供
 （自动续期或人工获取），本脚本无需关心 token 具体来源。
+
+2026-07 抓包更新：真正"执行签到"的接口路径已从 /up/api/v1/user/sign 变为
+/up/api/v1/user/sign/upgrade，且改走原生 SDK 签名体系（build_native_signature，
+NATIVE_APP_KEY/SECRET，签名头顺序 x-ca-nonce,x-ca-key,x-ca-timestamp，POST body
+即使是空对象 "{}" 也要计算 Content-MD5）。经实测验证，sweet_security_info/imei/
+gl_user_id/gl_dev_id 等设备风控头并非必需（不带也能 200 成功），故未携带，仅保留
+ca_version/x-requiretoken/User-Agent 等基础头。查询类接口（day/info、
+getContinueDaysAndSignCard）经抓包验证仍是原来的 H5 签名体系（build_signature），
+未受影响。
 """
 import json
 import sys
 
 import requests
 
-from lynkco_common import BASE_URL, DEFAULT_USER_AGENT, build_signature
+from lynkco_common import (
+    BASE_URL,
+    DEFAULT_USER_AGENT,
+    NATIVE_ANDROID_UA,
+    build_native_signature,
+    build_signature,
+)
 from lynkco_login import load_token
+
+EP_SIGN_DAY_INFO = "/up/api/v1/user/sign/day/info"
+EP_SIGN_UPGRADE = "/up/api/v1/user/sign/upgrade"  # 真正执行签到的接口（抓包确认，非 /up/api/v1/user/sign）
+EP_CONTINUE_DAYS = "/up/api/v1/userReward/getContinueDaysAndSignCard"
 
 
 class LynkCoSignClient:
@@ -23,6 +42,7 @@ class LynkCoSignClient:
         self.session = requests.Session()
 
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
+        """走 H5 签名体系（build_signature），用于查询类接口。"""
         # 注意：若请求带 query 参数（GET 的 params），必须一并传给 build_signature
         # 参与签名计算，否则服务端会返回 400 Invalid Signature（服务端的
         # StringToSign 里包含了完整的 "path?query"）。
@@ -49,19 +69,51 @@ class LynkCoSignClient:
             )
         return resp
 
+    def _native_request(self, method: str, path: str, body: bytes = None, **kwargs) -> requests.Response:
+        """
+        走 App 原生 SDK 签名体系（build_native_signature），用于 sign/upgrade 等
+        写操作接口。签名头顺序、Content-MD5 均对照真实抓包样本实现；
+        sweet_security_info/imei/gl_user_id 等设备风控头经实测非必需，故省略。
+        """
+        sig_headers = build_native_signature(
+            method, path,
+            accept="application/json; charset=utf-8",
+            content_type="application/json; charset=utf-8",
+            signature_headers_order="x-ca-nonce,x-ca-key,x-ca-timestamp",
+            body=body,
+        )
+        headers = {
+            **sig_headers,
+            "token": self.token,
+            "ca_version": "1",
+            "x-requiretoken": "false",
+            "User-Agent": NATIVE_ANDROID_UA,
+        }
+        headers.update(kwargs.pop("extra_headers", {}))
+        url = BASE_URL + path
+        resp = self.session.request(method, url, headers=headers, data=body, timeout=15, **kwargs)
+        try:
+            resp.json()
+        except ValueError:
+            raise RuntimeError(
+                f"[Native {method} {path}] 接口未返回有效 JSON，HTTP {resp.status_code}，"
+                f"x-ca-key={sig_headers.get('x-ca-key')!r}，响应体前200字符: {resp.text[:200]!r}"
+            )
+        return resp
+
     def get_sign_day_info(self) -> dict:
         """查询今日签到状态"""
-        resp = self._request("GET", "/up/api/v1/user/sign/day/info")
+        resp = self._request("GET", EP_SIGN_DAY_INFO)
         return resp.json()
 
     def do_sign(self) -> dict:
-        """执行签到"""
-        resp = self._request("POST", "/up/api/v1/user/sign")
+        """执行签到（POST /up/api/v1/user/sign/upgrade，原生签名，body 固定为空对象 "{}"）"""
+        resp = self._native_request("POST", EP_SIGN_UPGRADE, body=b"{}")
         return resp.json()
 
     def get_continue_days(self) -> dict:
         """查询连续签到天数和签到卡数量"""
-        resp = self._request("GET", "/up/api/v1/userReward/getContinueDaysAndSignCard")
+        resp = self._request("GET", EP_CONTINUE_DAYS)
         return resp.json()
 
 
