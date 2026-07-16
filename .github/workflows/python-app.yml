@@ -12,8 +12,8 @@ name: LynkCoHelperRunner
 
 on:
   schedule:
-    # 每天北京时间 1:00 执行 (UTC 前一天 17:00)
-    - cron: "0 17 * * *"
+    # 每天北京时间 7:00 执行 (UTC 前一天 23:00)
+    - cron: "0 23 * * *"
   workflow_dispatch:
 
 jobs:
