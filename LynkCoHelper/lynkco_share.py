@@ -23,6 +23,7 @@ from lynkco_common import (
     NATIVE_RISK_IMEI,
     build_native_signature,
     build_signature,
+    mask_sensitive,
 )
 from lynkco_login import load_token
 
@@ -331,7 +332,7 @@ def run_auto_share(token: str) -> dict:
     client = LynkCoShareClient(token)
     try:
         share_result = client.do_share()
-        print(json.dumps(share_result, ensure_ascii=False, indent=2))
+        print(json.dumps(mask_sensitive(share_result), ensure_ascii=False, indent=2))
         if share_result.get("ok"):
             print("\n分享任务成功！")
         else:

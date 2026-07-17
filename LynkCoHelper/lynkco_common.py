@@ -266,3 +266,27 @@ def save_env_fields(fields: dict, section: str = "user") -> None:
             json.dump(raw, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+# 打印接口响应到控制台/CI日志前需要脱敏的字段名（不区分大小写，同时匹配
+# userId/user_id/accountId/account_id 等驼峰、下划线两种命名风格）。
+_SENSITIVE_LOG_KEYS = {"userid", "user_id", "accountid", "account_id"}
+
+
+def mask_sensitive(data):
+    """
+    递归遍历 dict/list，把键名命中 _SENSITIVE_LOG_KEYS 的值替换为掩码字符串，
+    用于打印接口响应到控制台/CI日志前脱敏，避免泄露 userId/accountId。
+    不修改原始数据，返回一份新的结构。
+    """
+    if isinstance(data, dict):
+        result = {}
+        for k, v in data.items():
+            if isinstance(k, str) and k.replace("-", "_").lower() in _SENSITIVE_LOG_KEYS and v is not None:
+                result[k] = "***"
+            else:
+                result[k] = mask_sensitive(v)
+        return result
+    if isinstance(data, list):
+        return [mask_sensitive(item) for item in data]
+    return data

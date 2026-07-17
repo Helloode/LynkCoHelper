@@ -15,6 +15,7 @@ import os
 import sys
 import time
 
+from lynkco_common import mask_sensitive
 from lynkco_login import load_token
 from lynkco_notify import build_markdown_report, send_bark_notification
 from lynkco_sign import LynkCoSignClient
@@ -93,7 +94,7 @@ def run_and_notify() -> dict:
 
     print("=== 执行每日任务（签到+分享）===")
     result = run_daily_tasks(token, do_share=True)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    print(json.dumps(mask_sensitive(result), ensure_ascii=False, indent=2))
 
     markdown_body = build_markdown_report(result)
     print("\n=== 推送内容预览 ===")
@@ -115,7 +116,7 @@ def run_and_notify() -> dict:
         print(f"[警告] Bark 推送失败（不影响签到/分享结果）: {e}")
         notify_result = {"skipped": True, "error": str(e)}
     print("\n=== Bark 推送结果 ===")
-    print(json.dumps(notify_result, ensure_ascii=False, indent=2))
+    print(json.dumps(mask_sensitive(notify_result), ensure_ascii=False, indent=2))
 
     result["notify_result"] = notify_result
     return result

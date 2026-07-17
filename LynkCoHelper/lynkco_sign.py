@@ -25,6 +25,7 @@ from lynkco_common import (
     NATIVE_ANDROID_UA,
     build_native_signature,
     build_signature,
+    mask_sensitive,
 )
 from lynkco_login import load_token
 
@@ -129,7 +130,7 @@ def main():
     print("=== 查询签到状态 ===")
     try:
         day_info = client.get_sign_day_info()
-        print(json.dumps(day_info, ensure_ascii=False, indent=2))
+        print(json.dumps(mask_sensitive(day_info), ensure_ascii=False, indent=2))
     except Exception as e:
         print(f"[错误] 查询签到状态失败: {e}")
         sys.exit(1)
@@ -145,7 +146,7 @@ def main():
         print("\n=== 执行签到 ===")
         try:
             sign_result = client.do_sign()
-            print(json.dumps(sign_result, ensure_ascii=False, indent=2))
+            print(json.dumps(mask_sensitive(sign_result), ensure_ascii=False, indent=2))
             if sign_result.get("success"):
                 print("\n签到成功！")
             else:
@@ -157,7 +158,7 @@ def main():
     print("\n=== 连续签到信息 ===")
     try:
         continue_info = client.get_continue_days()
-        print(json.dumps(continue_info, ensure_ascii=False, indent=2))
+        print(json.dumps(mask_sensitive(continue_info), ensure_ascii=False, indent=2))
     except Exception as e:
         print(f"[警告] 查询连续签到信息失败: {e}")
 
