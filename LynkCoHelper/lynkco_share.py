@@ -41,7 +41,7 @@ EP_SHARE_REPORTING_SIMPLE = "/app/v1/task/shareReporting"
 # body 故可直接复用），否则只返回首屏、命中"文章"类型的概率很低。
 EP_EXPLORE_SQUARE_INDEX = "/app/explore/home-page/square/index2"
 # get_latest_article() 命中第一篇文章前最多尝试翻的页数。
-EXPLORE_SQUARE_PAGE_COUNT = 2
+EXPLORE_SQUARE_PAGE_COUNT = 5
 
 # 分享落地页 H5 域名（与签到用的 h5.lynkco.cn 是两个不同域名/Origin，
 # shareReporting 接口的签名 AppKey 虽然相同，但网关会校验 Origin/Referer）。
