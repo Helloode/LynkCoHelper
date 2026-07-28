@@ -12,8 +12,8 @@ name: LynkCoHelperRunner
 
 on:
   schedule:
-    # 预计每天北京时间 9:00 执行 (UTC 1:00)
-    - cron: "0 1 * * *"
+    # 预计每天北京时间 9:00 执行 (UTC 1:00)，github action调度有延迟，可采用（ios快捷指令等）定时调用github接口主动触发任务。
+    - cron: "0 0 * * *"
   workflow_dispatch:
 
 jobs:
