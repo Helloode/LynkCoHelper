@@ -101,8 +101,7 @@ def run_and_notify() -> dict:
     print(markdown_body)
 
     icon = os.environ.get(
-        "LYNKCO_BARK_ICON",
-        "https://app-cdn.lynkco.com/lynkcoapp-production/avatar/29410b4480c0b74a4fa323c3a96427916506bf62.png",
+        "LYNKCO_BARK_ICON"
     )
     try:
         notify_result = send_bark_notification(
