@@ -108,7 +108,7 @@ def send_bark_notification(title: str, markdown_body: str, group: str = "LynkCoç
     resp = requests.post(
         url, json=payload,
         headers={"Content-Type": "application/json; charset=utf-8"},
-        timeout=15,
+        timeout=30,
     )
     resp.raise_for_status()
     return resp.json()

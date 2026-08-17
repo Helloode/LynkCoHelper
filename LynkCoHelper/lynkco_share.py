@@ -24,6 +24,7 @@ from lynkco_common import (
     build_native_signature,
     build_signature,
     mask_sensitive,
+    request_with_retry,
 )
 from lynkco_login import load_token
 
@@ -79,24 +80,27 @@ class LynkCoShareClient:
 
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
         """走 H5 签名体系（build_signature）请求 app-api-gw-toc.lynkco.com 网关。"""
-        sig_headers = build_signature(method, path, query=kwargs.get("params"))
-        headers = {
-            **sig_headers,
-            "token": self.token,
-            "Origin": "https://h5.lynkco.cn",
-            "Referer": "https://h5.lynkco.cn/",
-            "content-type": "application/json",
-            "Accept": "*/*",
-        }
-        headers.update(kwargs.pop("extra_headers", {}))
+        extra_headers = kwargs.pop("extra_headers", {})
         url = BASE_URL + path
-        resp = self.session.request(method, url, headers=headers, timeout=15, **kwargs)
+        resp = request_with_retry(
+            self.session, method, url,
+            build_headers=lambda: {
+                **build_signature(method, path, query=kwargs.get("params")),
+                "token": self.token,
+                "Origin": "https://h5.lynkco.cn",
+                "Referer": "https://h5.lynkco.cn/",
+                "content-type": "application/json",
+                "Accept": "*/*",
+                **extra_headers,
+            },
+            **kwargs,
+        )
         try:
             resp.json()
         except ValueError:
             print(
                 f"[警告][H5 {method} {path}] 接口未返回有效 JSON，HTTP {resp.status_code}，"
-                f"X-Ca-Key={sig_headers.get('X-Ca-Key')!r}，响应体前200字符: {resp.text[:200]!r}"
+                f"响应体前200字符: {resp.text[:200]!r}"
             )
         return resp
 
@@ -104,39 +108,35 @@ class LynkCoShareClient:
         """
         走 App 原生 SDK 签名体系（build_native_signature）请求
         app-api-gw-toc.lynkco.com 网关的部分端点（如 getShareCode）。
-
-        与 _request()（H5 签名体系）的区别：
-        - 原生 SDK 请求默认不带 Origin/Referer（App 内直接调用，非浏览器环境），
-          User-Agent 固定为 "ALIYUN-ANDROID-UA"；
-        - 额外携带 gl_dev_id / gl_user_id / imei / os / sweet_security_info 等
-          设备指纹与风控头，均来自真实抓包样本（详见 get_share_code 调用处）。
         """
-        sig_headers = build_native_signature(
-            method, path, query=kwargs.get("params"),
-            signature_headers_order="x-ca-nonce,x-ca-key,x-ca-timestamp",
-        )
-        headers = {
-            **sig_headers,
-            "token": self.token,
-            "svcsid": self.token,
-            "ca_version": "1",
-            "appversion": "4.2.3",
-            "appVersionCode": "4.2.3",
-            "appVersionName": "402030320",
-            "publicPlatform": "android",
-            "User-Agent": NATIVE_ANDROID_UA,
-        }
-        headers.update(NATIVE_DEVICE_HEADERS)
-        if extra_headers:
-            headers.update(extra_headers)
+        extra = extra_headers or {}
         url = BASE_URL + path
-        resp = self.session.request(method, url, headers=headers, timeout=15, **kwargs)
+        resp = request_with_retry(
+            self.session, method, url,
+            build_headers=lambda: {
+                **build_native_signature(
+                    method, path, query=kwargs.get("params"),
+                    signature_headers_order="x-ca-nonce,x-ca-key,x-ca-timestamp",
+                ),
+                "token": self.token,
+                "svcsid": self.token,
+                "ca_version": "1",
+                "appversion": "4.2.3",
+                "appVersionCode": "4.2.3",
+                "appVersionName": "402030320",
+                "publicPlatform": "android",
+                "User-Agent": NATIVE_ANDROID_UA,
+                **NATIVE_DEVICE_HEADERS,
+                **extra,
+            },
+            **kwargs,
+        )
         try:
             resp.json()
         except ValueError:
             print(
                 f"[警告][Native {method} {path}] 接口未返回有效 JSON，HTTP {resp.status_code}，"
-                f"x-ca-key={sig_headers.get('x-ca-key')!r}，响应体前200字符: {resp.text[:200]!r}"
+                f"响应体前200字符: {resp.text[:200]!r}"
             )
         return resp
 
