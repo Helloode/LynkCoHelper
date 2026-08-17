@@ -44,5 +44,7 @@ jobs:
         # {"h5AppKey":"","h5AppSecret":"","nativeAppKey":"","nativeAppSecret":"",
         #  "nativeAppCode":"","loginAppCode":"","deviceImei":"","glDevId":""}
         LYNKCO_APP_SECRETS: ${{ secrets.LYNKCO_APP_SECRETS }}
+        # Bark 推送图标 URL（可选项，不配则 Bark 使用默认图标）
+        LYNKCO_BARK_ICON: ${{ secrets.LYNKCO_BARK_ICON }}
       run: |
         python ./LynkCoHelper/lynkco_daily_tasks.py
