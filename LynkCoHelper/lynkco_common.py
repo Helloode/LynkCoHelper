@@ -25,7 +25,15 @@ import os
 import time
 import uuid
 
+import requests.exceptions
+
 ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "env.json")
+
+# 网络请求默认超时（秒），GitHub Actions runner 到领克服务器延迟较高，
+# 15 秒不够。可通过环境变量覆盖。
+DEFAULT_TIMEOUT = int(os.environ.get("LYNKCO_TIMEOUT", "30"))
+# 超时/断连后自动重试次数（每次间隔 3 秒），重试时会重新生成签名。
+DEFAULT_RETRIES = 2
 
 # 密钥字段名 -> (环境变量名, env.json["secrets"] 字段名)
 _SECRET_SPECS = {
@@ -112,6 +120,25 @@ def __getattr__(name: str):
     if name in _LAZY_ATTRS:
         return _LAZY_ATTRS[name]()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def request_with_retry(session, method: str, url: str, *, build_headers, retries: int = DEFAULT_RETRIES, timeout: int = DEFAULT_TIMEOUT, **kwargs) -> requests.Response:
+    """带超时重试的请求封装。build_headers 是一个无参回调，每次尝试（含重试）
+    时调用以重新生成签名头（刷新 nonce/timestamp），保证签名时效性。
+    遇到 ReadTimeout / ConnectionError 时等待 3 秒后重试，最多 retries 次。"""
+    last_exc = None
+    for attempt in range(retries + 1):
+        headers = build_headers()
+        try:
+            return session.request(method, url, headers=headers, timeout=timeout, **kwargs)
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
+            last_exc = e
+            if attempt < retries:
+                print(f"[警告] 请求超时/断连，3秒后重试（第 {attempt + 1}/{retries} 次）: {e}")
+                time.sleep(3)
+            else:
+                print(f"[警告] 请求重试 {retries} 次后仍失败: {e}")
+    raise last_exc
 
 
 def build_signature(method: str, path: str, accept: str = "*/*",

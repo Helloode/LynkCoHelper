@@ -88,7 +88,7 @@ def refresh_token_by_appcode(refresh_token_value: str, device_id: str) -> dict:
     }
 
     url = NATIVE_BASE_URL + path
-    resp = requests.get(url, params=query, headers=headers, timeout=15)
+    resp = requests.get(url, params=query, headers=headers, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     return _parse_refresh_response(data, refresh_token_value)
@@ -108,7 +108,7 @@ def refresh_token_by_signature(refresh_token_value: str, device_id: str) -> dict
     headers.update(NATIVE_DEVICE_HEADERS)
 
     url = NATIVE_BASE_URL + path
-    resp = requests.get(url, params=query, headers=headers, timeout=15)
+    resp = requests.get(url, params=query, headers=headers, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     return _parse_refresh_response(data, refresh_token_value)
@@ -175,7 +175,7 @@ def get_security_config(device_id: str) -> dict:
     headers["gl_dev_id"] = device_id  # 覆盖 NATIVE_DEVICE_HEADERS 里的默认设备id
 
     url = NATIVE_BASE_URL + path
-    resp = requests.get(url, params=query, headers=headers, timeout=15)
+    resp = requests.get(url, params=query, headers=headers, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
@@ -216,7 +216,7 @@ def validate_geetest(device_id: str, lot_number: str, captcha_output: str,
     headers["gl_dev_id"] = device_id  # 覆盖 NATIVE_DEVICE_HEADERS 里的默认设备id
 
     url = NATIVE_BASE_URL + path
-    resp = requests.post(url, data=body_bytes, headers=headers, timeout=15)
+    resp = requests.post(url, data=body_bytes, headers=headers, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
@@ -243,7 +243,7 @@ def send_login_sms(device_id: str, mobile: str, certify_id: str) -> dict:
     headers["gl_dev_id"] = device_id  # 覆盖 NATIVE_DEVICE_HEADERS 里的默认设备id
 
     url = NATIVE_BASE_URL + path
-    resp = requests.post(url, data=body_bytes, headers=headers, timeout=15)
+    resp = requests.post(url, data=body_bytes, headers=headers, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
@@ -284,7 +284,7 @@ def login_by_mobile_code(device_id: str, mobile: str, verification_code: str) ->
     headers["gl_dev_id"] = device_id  # 覆盖 NATIVE_DEVICE_HEADERS 里的默认设备id
 
     url = NATIVE_BASE_URL + path
-    resp = requests.post(url, params=query, data=body_bytes, headers=headers, timeout=15)
+    resp = requests.post(url, params=query, data=body_bytes, headers=headers, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     result = _parse_refresh_response(data, refresh_token_value="")
@@ -366,7 +366,7 @@ def login_by_password(device_id: str, username: str, password_md5: str, certify_
         headers["gl_dev_id"] = device_id  # 覆盖 NATIVE_DEVICE_HEADERS 里的默认设备id
 
     url = NATIVE_BASE_URL + path
-    resp = requests.post(url, params=query, data=body_bytes, headers=headers, timeout=15)
+    resp = requests.post(url, params=query, data=body_bytes, headers=headers, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     if data.get("code") != "success":

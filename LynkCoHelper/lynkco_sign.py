@@ -26,6 +26,7 @@ from lynkco_common import (
     build_native_signature,
     build_signature,
     mask_sensitive,
+    request_with_retry,
 )
 from lynkco_login import load_token
 
@@ -45,60 +46,62 @@ class LynkCoSignClient:
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
         """走 H5 签名体系（build_signature），用于查询类接口。"""
         # 注意：若请求带 query 参数（GET 的 params），必须一并传给 build_signature
-        # 参与签名计算，否则服务端会返回 400 Invalid Signature（服务端的
-        # StringToSign 里包含了完整的 "path?query"）。
-        sig_headers = build_signature(method, path, query=kwargs.get("params"))
-        headers = {
-            **sig_headers,
-            "token": self.token,
-            "Origin": "https://h5.lynkco.cn",
-            "Referer": "https://h5.lynkco.cn/",
-            "User-Agent": DEFAULT_USER_AGENT,
-            "content-type": "application/json",
-            "Accept": "*/*",
-        }
-        headers.update(kwargs.pop("extra_headers", {}))
+        # 参与签名计算，否则服务端会返回 400 Invalid Signature。
+        extra_headers = kwargs.pop("extra_headers", {})
         url = BASE_URL + path
-        resp = self.session.request(method, url, headers=headers, timeout=15, **kwargs)
+        resp = request_with_retry(
+            self.session, method, url,
+            build_headers=lambda: {
+                **build_signature(method, path, query=kwargs.get("params")),
+                "token": self.token,
+                "Origin": "https://h5.lynkco.cn",
+                "Referer": "https://h5.lynkco.cn/",
+                "User-Agent": DEFAULT_USER_AGENT,
+                "content-type": "application/json",
+                "Accept": "*/*",
+                **extra_headers,
+            },
+            **kwargs,
+        )
         try:
             resp.json()
         except ValueError:
             raise RuntimeError(
                 f"[{method} {path}] 接口未返回有效 JSON（可能被网关拦截，如境外 IP 访问限制"
-                f"或 AppKey 未授权），HTTP {resp.status_code}，X-Ca-Key={sig_headers.get('X-Ca-Key')!r}，"
+                f"或 AppKey 未授权），HTTP {resp.status_code}，"
                 f"响应体前200字符: {resp.text[:200]!r}"
             )
         return resp
 
     def _native_request(self, method: str, path: str, body: bytes = None, **kwargs) -> requests.Response:
-        """
-        走 App 原生 SDK 签名体系（build_native_signature），用于 sign/upgrade 等
-        写操作接口。签名头顺序、Content-MD5 均对照真实抓包样本实现；
-        sweet_security_info/imei/gl_user_id 等设备风控头经实测非必需，故省略。
-        """
-        sig_headers = build_native_signature(
-            method, path,
-            accept="application/json; charset=utf-8",
-            content_type="application/json; charset=utf-8",
-            signature_headers_order="x-ca-nonce,x-ca-key,x-ca-timestamp",
-            body=body,
-        )
-        headers = {
-            **sig_headers,
-            "token": self.token,
-            "ca_version": "1",
-            "x-requiretoken": "false",
-            "User-Agent": NATIVE_ANDROID_UA,
-        }
-        headers.update(kwargs.pop("extra_headers", {}))
+        """走 App 原生 SDK 签名体系（build_native_signature），用于 sign/upgrade 等写操作接口。"""
+        extra_headers = kwargs.pop("extra_headers", {})
         url = BASE_URL + path
-        resp = self.session.request(method, url, headers=headers, data=body, timeout=15, **kwargs)
+        resp = request_with_retry(
+            self.session, method, url,
+            build_headers=lambda: {
+                **build_native_signature(
+                    method, path,
+                    accept="application/json; charset=utf-8",
+                    content_type="application/json; charset=utf-8",
+                    signature_headers_order="x-ca-nonce,x-ca-key,x-ca-timestamp",
+                    body=body,
+                ),
+                "token": self.token,
+                "ca_version": "1",
+                "x-requiretoken": "false",
+                "User-Agent": NATIVE_ANDROID_UA,
+                **extra_headers,
+            },
+            data=body,
+            **kwargs,
+        )
         try:
             resp.json()
         except ValueError:
             raise RuntimeError(
                 f"[Native {method} {path}] 接口未返回有效 JSON，HTTP {resp.status_code}，"
-                f"x-ca-key={sig_headers.get('x-ca-key')!r}，响应体前200字符: {resp.text[:200]!r}"
+                f"响应体前200字符: {resp.text[:200]!r}"
             )
         return resp
 

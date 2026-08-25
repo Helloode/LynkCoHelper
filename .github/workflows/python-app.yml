@@ -12,8 +12,8 @@ name: LynkCoHelperRunner
 
 on:
   schedule:
-    # 每天北京时间 7:00 执行 (UTC 前一天 23:00)
-    - cron: "0 23 * * *"
+    # 预计每天北京时间 9:00 执行 (UTC 1:00)，github action调度有延迟，可采用（ios快捷指令等）定时调用github接口主动触发任务。
+    - cron: "0 0 * * *"
   workflow_dispatch:
 
 jobs:
@@ -44,5 +44,7 @@ jobs:
         # {"h5AppKey":"","h5AppSecret":"","nativeAppKey":"","nativeAppSecret":"",
         #  "nativeAppCode":"","loginAppCode":"","deviceImei":"","glDevId":""}
         LYNKCO_APP_SECRETS: ${{ secrets.LYNKCO_APP_SECRETS }}
+        # Bark 推送图标 URL（可选项，不配则 Bark 使用默认图标）
+        LYNKCO_BARK_ICON: ${{ secrets.LYNKCO_BARK_ICON }}
       run: |
         python ./LynkCoHelper/lynkco_daily_tasks.py
