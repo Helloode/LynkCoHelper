@@ -88,6 +88,14 @@ adb shell getprop ro.build.type   # userdebug
 | JDK（提供 `jdb`） | OpenJDK 1.8.0（Corretto 8），`jdb` 协议版本 1.8 |
 | Android SDK 位置 | `$HOME/Library/Android/sdk`（`platform-tools`/`emulator` 需在 `PATH` 中） |
 
+> **2026-08-25 二次复现补充**：Android Emulator 升级到 37.1.11.0、宿主机 macOS
+> 26.6 同样可复现；Corretto 8 若因 Homebrew Cask 需要 sudo 装不上，可
+> `brew fetch --cask corretto@8` 下载 pkg 后用 `xar -xf` + `cat Payload |
+> gunzip -dc | cpio -idmu` 手动解包到用户级目录
+> `~/Library/Java/JavaVirtualMachines/amazon-corretto-8.jdk`（免 sudo，jdb
+> 1.8 验证可用）。此外本次复现发现三个与版本无关的平台级新坑，见第 4.5 节——
+> **其中坑 2/3 会导致 4.3 节的直连流程跑不通，实际操作请优先走 4.5 节的代理方案**。
+
 ## 4. 最终成功路线：`am start -D` + `jdb`（JDWP）在 Java 层断点静态初始化块
 
 ### 4.1 思路
@@ -145,6 +153,12 @@ adb forward tcp:8700 jdwp:$NEWPID
 python3 drive_jdb.py
 adb forward --remove tcp:8700
 ```
+
+> ⚠️ **注意**：以上"先 `am start -D` 挂起、再手动跑脚本"的直连流程依赖
+> "App 阻塞在 waitForDebugger 时 JDWP 仍可握手"这一前提。2026-08-25 复现实测
+> 该前提**不再成立**（App 一旦进入 waitForDebugger 阻塞态，JDWP 握手即挂死），
+> 直连流程会一直卡在 "Waiting For Debugger" 弹窗。**实际操作请直接使用
+> 4.5 节的本地 TCP 代理方案**（`drive_jdb_proxy.py`），保留本节仅作原理说明。
 
 对应的 `jdb` 交互命令序列（注意每条命令都要等上一条的提示符返回后再发送）：
 
@@ -304,6 +318,282 @@ d/e                          <- 另一套日志上报用的 APP_KEY/APP_SECRET�
 > 中已保存的 `nativeAppKey`/`nativeAppSecret` **完全一致**，交叉验证了本文档方法
 > 的可复现性与准确性。
 
+### 4.5 2026-08-25 二次复现发现的三个新坑与本地 TCP 代理方案
+
+在另一台 mac（macOS 26.6 / Emulator 37.1.11.0 / 同款 android-33 arm64-v8a 镜像）
+上复现时，4.3 节的直连流程**完全跑不通**——App 一直卡在 "Waiting For Debugger"
+弹窗，jdb 连上后无任何输出直至挂死。逐层排查（原始 socket 探测 JDWP 握手、
+系统应用对照实验、`adb root`、重启 adb server）后定位到三个此前未记载的坑：
+
+**坑 1：模拟器从快照恢复（snapshot-load）会让 adbd 的 jdwp 转发永久挂死。**
+表现为：所有进程（包括 Settings 等系统应用）的 `adb forward tcp:N jdwp:<pid>`
+都能建立 TCP 连接，但发送 `JDWP-Handshake` 后永远收不到回显；`adb kill-server`
+/ `adb root` 重启 adbd 均无效。**唯一解法：`-no-snapshot-load -no-snapshot-save`
+冷启动模拟器**（本文档 4.3 节第 0 步其实一直带着该参数，但之前没意识到它是
+硬性前提，不是可选项）。
+
+**坑 2：即使冷启动，App 一旦真正进入 waitForDebugger 阻塞态，JDWP 握手也会挂死。**
+这是最反直觉的一条：通过竞速实验实测——从 `am start -D` 后轮询到 PID 出现，
+**在进程 fork 后约 0.5 秒内（尚未执行到 `waitForDebugger` 的早期窗口）立即发起
+JDWP 握手可以成功**；超过这个窗口、App 挂起等待调试器之后，握手永久超时。
+对照实验证实连 Settings（毫无反调试的系统应用）也如此，说明这是平台级行为
+（adbd jdwp 服务 + `am start -D` 挂起态的交互问题），**不是领克 App 的对抗**。
+这正是 4.3 节直连流程跑不通的根因：人工敲命令的速度永远赶不上 0.5 秒窗口。
+
+**坑 3：jdb 是 JVM，冷启动需 1-3 秒，来不及在窗口期内发起握手。**
+即使把 `am start -D` 与 `jdb -attach` 写进同一个脚本无脑抢跑，jdb 也赶不上。
+
+**解法：本地 TCP 代理抢跑方案（`drive_jdb_proxy.py`，本次实际成功路线）。**
+
+```
+代理监听 8700 -> jdb 先连代理并阻塞在握手阶段（jdb 启动慢不再是问题）
+  -> am start -D 启动 App -> 高频轮询 pidof（30ms 间隔）
+  -> PID 出现瞬间 adb forward tcp:8701 jdwp:<pid>
+  -> 代理立刻连上游 8701，抢先完成 JDWP 握手（命中 0.5s 早期窗口）
+  -> 把握手回显转交给 jdb，此后双向字节转发
+  -> jdb 侧：suspend（先冻结 VM 赢得与 clinit 的竞速）-> stop in <clinit>
+     -> resume -> 断点命中 -> next + print 探测（同 4.3 节）-> kill -9 jdb
+```
+
+关键设计点：
+
+- **握手由代理在 Python 进程内完成**（socket 级 14 字节 `JDWP-Handshake`
+  交换），Python 轮询 + 连接的总延迟可以控制在几十毫秒内，稳定命中早期窗口；
+- jdb 只与本地代理通信，其慢启动被"提前连上、挂起等握手"完全吸收；
+- 握手完成后 jdb 侧先 `suspend` 冻结整个 VM 再下断点、然后 `resume`——比
+  直连流程的 `run` 更稳，最大限度赢得与 `<clinit>` 执行的竞速；
+- 结束时同样 `kill -9` 本地 jdb（不发 `quit`），并 `adb forward --remove`
+  清理上游转发。
+
+完整可复现代码（在 `drive_jdb.py` 基础上重写，**推荐作为首选流程**；依赖与
+用法同 4.3 节，仅需 `pexpect`）：
+
+```python
+#!/usr/bin/env python3
+"""
+drive_jdb_proxy.py —— 本地 TCP 代理抢跑版密钥提取（首选方案）。
+
+背景：App 进入 waitForDebugger 阻塞态后，adbd 的 jdwp 转发握手会永久挂死
+（系统应用同样如此）；只有在 App 进程刚 fork、尚未执行到 waitForDebugger 的
+窗口期（约 0.5s 内）完成 JDWP 握手才能成功。jdb 是 JVM 冷启动 1-3s 赶不上，
+故由 Python 代理抢先握手。前置：模拟器必须 -no-snapshot-load 冷启动（坑1）。
+
+用法: python3 drive_jdb_proxy.py
+注意：仅在本地临时使用，提取完成后应删除，密钥不应写入代码仓库。
+"""
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+import pexpect
+
+ADB = os.path.expanduser("~/Library/Android/sdk/platform-tools/adb")
+CORRETTO8_JDB = os.path.expanduser(
+    "~/Library/Java/JavaVirtualMachines/amazon-corretto-8.jdk/Contents/Home/bin/jdb")
+# macOS 的 /usr/bin/jdb 只是桩，PATH 里没有真 jdb 时回退到用户级 Corretto 8
+JDB = "jdb" if shutil.which("jdb") and shutil.which("jdb") != "/usr/bin/jdb" else CORRETTO8_JDB
+
+APP = "com.lynkco.customer"
+ACTIVITY = "com.lynkco.customer/com.geely.lynkco.main.activity.LynkCoEntranceActivity"
+CLASS = "com.safe.cons.LynkCoConstants$g"
+
+PROXY_PORT = 8700      # jdb -> 代理
+UPSTREAM_PORT = 8701   # 代理 -> adb forward -> jdwp:<pid>
+
+BREAKPOINT_PATTERNS = ["Breakpoint hit", "断点命中"]
+EMPTY_VALUES = {"null", '""', "", "= null", "空值"}  # 必须含中文"空值"
+
+
+def adb(*args):
+    return subprocess.run([ADB, *args], capture_output=True, text=True).stdout.strip()
+
+
+class Proxy:
+    """jdb 先连上并挂起在握手阶段；等上游就绪后抢先握手并双向转发。"""
+
+    def __init__(self):
+        self.upstream_ready = threading.Event()
+        self.handshake_done = threading.Event()
+        self.status = "init"
+
+    def start_and_serve(self):
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", PROXY_PORT))
+        srv.listen(1)
+        # 1. 接受 jdb 连接，读取其握手请求并挂起
+        self.jdb_sock, _ = srv.accept()
+        hs = b""
+        while len(hs) < 14:
+            chunk = self.jdb_sock.recv(14 - len(hs))
+            if not chunk:
+                raise RuntimeError("jdb 在握手前断开")
+            hs += chunk
+        assert hs == b"JDWP-Handshake", hs
+        self.status = "jdb_connected"
+        srv.close()
+
+        # 2. 等主流程通知上游就绪
+        self.upstream_ready.wait(timeout=30)
+        # 3. 抢先连接上游（命中早期窗口）并完成握手
+        up = socket.socket()
+        up.settimeout(10)
+        up.connect(("127.0.0.1", UPSTREAM_PORT))
+        up.sendall(b"JDWP-Handshake")
+        echo = b""
+        while len(echo) < 14:
+            c = up.recv(14 - len(echo))
+            if not c:
+                raise RuntimeError("上游握手被关闭")
+            echo += c
+        assert echo == b"JDWP-Handshake"
+        up.settimeout(None)
+        self.up_sock = up
+        self.jdb_sock.sendall(echo)  # 把握手回显交给 jdb
+        self.handshake_done.set()
+        self.status = "relaying"
+
+        # 4. 双向转发
+        def pump(a, b):
+            try:
+                while True:
+                    data = a.recv(65536)
+                    if not data:
+                        break
+                    b.sendall(data)
+            except OSError:
+                pass
+            try:
+                b.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+        t1 = threading.Thread(target=pump, args=(self.jdb_sock, up), daemon=True)
+        t2 = threading.Thread(target=pump, args=(up, self.jdb_sock), daemon=True)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+        self.status = "closed"
+
+
+def send_cmd(child, cmd, timeout=15):
+    child.sendline(cmd)
+    time.sleep(0.3)
+    try:
+        child.expect(["> ", pexpect.TIMEOUT], timeout=timeout)
+    except Exception:
+        pass
+    return child.before
+
+
+def main():
+    proxy = Proxy()
+    threading.Thread(target=proxy.start_and_serve, daemon=True).start()
+    time.sleep(0.3)  # 等代理开始监听
+
+    print(f"[*] Using jdb: {JDB}")
+    child = pexpect.spawn(f"{JDB} -attach {str(PROXY_PORT)}", timeout=60, encoding="utf-8")
+    child.logfile = sys.stdout
+
+    # 等 jdb 完成与代理的 TCP 连接（握手暂时挂起）
+    for _ in range(50):
+        if proxy.status in ("jdb_connected", "upstream_ready", "relaying"):
+            break
+        time.sleep(0.1)
+    print("\n[*] jdb 已连上代理（阻塞在握手），现在启动 App ...")
+
+    # 启动 App（等待调试器状态），进程一出现立刻建立 forward 并放行代理
+    adb("shell", f"am force-stop {APP}")
+    time.sleep(0.5)
+    adb("shell", "am", "start", "-D", "-n", ACTIVITY)
+    t0 = time.time()
+    pid = None
+    for _ in range(200):
+        out = adb("shell", f"pidof {APP}").strip()
+        if out and out.split()[0].isdigit():
+            pid = out.split()[0]
+            break
+        time.sleep(0.03)
+    if not pid:
+        print("[!] 未取到 App PID")
+        child.kill(9)
+        return
+    print(f"[*] PID={pid} (t={time.time()-t0:.2f}s)，立即建立转发 ...")
+    adb("forward", f"tcp:{UPSTREAM_PORT}", f"jdwp:{pid}")
+    proxy.upstream_ready.set()
+
+    if not proxy.handshake_done.wait(timeout=15):
+        print("[!] 上游握手失败（可能错过早期窗口）")
+        child.kill(9)
+        return
+    print("[+] JDWP 握手完成（命中早期窗口）！\n")
+
+    # 等 jdb 初始化完成出现提示符
+    try:
+        child.expect(["> ", pexpect.EOF, pexpect.TIMEOUT], timeout=30)
+    except Exception:
+        pass
+
+    # 尽快冻结 VM，最大限度赢得与 clinit 的竞速
+    print("\n[*] suspend")
+    send_cmd(child, "suspend", timeout=10)
+
+    print("\n[*] Setting breakpoint ...")
+    send_cmd(child, f"stop in {CLASS}.<clinit>")
+
+    print("\n[*] resume")
+    send_cmd(child, "resume", timeout=10)
+
+    idx = child.expect(BREAKPOINT_PATTERNS + [pexpect.EOF, pexpect.TIMEOUT], timeout=90)
+    if idx < len(BREAKPOINT_PATTERNS):
+        print("\n[+] Breakpoint hit!")
+        time.sleep(0.2)
+        try:
+            child.expect(["> ", pexpect.TIMEOUT], timeout=5)
+        except Exception:
+            pass
+        max_steps = 15
+        for i in range(max_steps):
+            print(f"\n[*] next (step {i + 1})")
+            send_cmd(child, "next", timeout=15)
+            out = send_cmd(child, f"print {CLASS}.c", timeout=10)
+            val_line = [l for l in out.splitlines() if "=" in l]
+            val = val_line[-1].split("=", 1)[-1].strip() if val_line else ""
+            print(f"    -> c probe: {val!r}")
+            if val and val not in EMPTY_VALUES:
+                break
+    else:
+        print("\n[!] 未命中断点（clinit 可能已提前执行），直接尝试打印字段 ...")
+
+    print("\n[*] Dumping fields b/c/d/e ...")
+    results = {}
+    for field in ["b", "c", "d", "e"]:
+        results[field] = send_cmd(child, f"print {CLASS}.{field}", timeout=10)
+
+    print("\n" + "=" * 60)
+    print("[RESULT]")
+    for field, out in results.items():
+        print(f"--- {field} raw output ---")
+        print(out)
+    print("=" * 60)
+
+    print("\n[*] Done. Killing local jdb with SIGKILL (NOT quit) ...")
+    child.kill(9)
+    adb("forward", "--remove", f"tcp:{UPSTREAM_PORT}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+2026-08-25 实测：代理方案一次成功——PID 出现后 0.04s 内完成上游握手，
+`suspend` -> 断点 -> `resume` 后命中 `LynkCoConstants$g.<clinit>`，同样仅
+2 次 `next` 即探测到 `c` 赋值，提取结果与原文档记录一致，App 进程全程存活。
+
+
 ## 5. 验证：确认 AppSecret 与签名算法均正确
 
 拿到候选 `appSecret` 后，用真实抓包样本反向验证签名算法。
@@ -350,7 +640,9 @@ d/e                          <- 另一套日志上报用的 APP_KEY/APP_SECRET�
 - 若未来领克升级 App 并更换密钥（常见于大版本更新或更换加固方案时），签名会
   重新返回 403，需重新执行第 4 节的流程提取，并按第 5 节验证。重新提取前请先
   确认第 3 节的前置条件（设备系统固件为 `userdebug`/`eng`）仍满足，否则需先
-  换用模拟器或工程机。
+  换用模拟器或工程机。**注意 4.5 节的三个坑**：模拟器必须 `-no-snapshot-load`
+  冷启动（快照恢复会让 jdwp 转发挂死），且应优先使用 `drive_jdb_proxy.py`
+  代理方案而非 4.3 节的直连流程（后者在 waitForDebugger 挂起态下握手不通）。
 - 若某个 App 版本调整了密钥调用链（类名/方法名/字段名混淆变化），需先重新做静态
   分析定位新的调用路径（参考第 1 节的分析思路）。
 - **环境要求小结**：本方法不依赖 root，也不依赖 App 自身的
