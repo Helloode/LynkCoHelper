@@ -88,7 +88,7 @@ python3 lynkco_daily_tasks.py    # 签到 + 分享 + 积分查询 + Bark 推送
 
 ## 部署到 GitHub Actions 定时执行
 
-项目内置 `.github/workflows/python-app.yml`，默认每天北京时间 1:00 自动运行。
+项目内置 `.github/workflows/daily-tasks.yml`，默认每天北京时间 8:00（UTC 0:00，GitHub 调度可能有延迟）自动运行。
 
 1. Fork 本仓库。
 2. 进入 `Settings → Secrets and variables → Actions`，新增 Secret：

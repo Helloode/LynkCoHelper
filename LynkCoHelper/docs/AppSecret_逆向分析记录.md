@@ -13,6 +13,9 @@
 `x-ca-signature` 签名，实现自动续期，见 `lynkco_common.py` 的
 `build_native_signature()` 和 `lynkco_login.py` 的 `refresh_token()`。
 
+> **速查入口**：密钥失效后只想重新提取、不想读原理分析的，直接跳到
+> **第 7 节**——一条命令完成提取（仅需一次性创建模拟器并装入 App）。
+
 ---
 
 ## 1. 背景：为什么不能靠静态反编译直接拿到明文
@@ -158,7 +161,7 @@ adb forward --remove tcp:8700
 > "App 阻塞在 waitForDebugger 时 JDWP 仍可握手"这一前提。2026-08-25 复现实测
 > 该前提**不再成立**（App 一旦进入 waitForDebugger 阻塞态，JDWP 握手即挂死），
 > 直连流程会一直卡在 "Waiting For Debugger" 弹窗。**实际操作请直接使用
-> 4.5 节的本地 TCP 代理方案**（`drive_jdb_proxy.py`），保留本节仅作原理说明。
+> 4.5 节的本地 TCP 代理方案**（`tools/extract_appsecret.py`），保留本节仅作原理说明。
 
 对应的 `jdb` 交互命令序列（注意每条命令都要等上一条的提示符返回后再发送）：
 
@@ -343,7 +346,7 @@ JDWP 握手可以成功**；超过这个窗口、App 挂起等待调试器之后
 **坑 3：jdb 是 JVM，冷启动需 1-3 秒，来不及在窗口期内发起握手。**
 即使把 `am start -D` 与 `jdb -attach` 写进同一个脚本无脑抢跑，jdb 也赶不上。
 
-**解法：本地 TCP 代理抢跑方案（`drive_jdb_proxy.py`，本次实际成功路线）。**
+**解法：本地 TCP 代理抢跑方案（`tools/extract_appsecret.py`，本次实际成功路线）。**
 
 ```
 代理监听 8700 -> jdb 先连代理并阻塞在握手阶段（jdb 启动慢不再是问题）
@@ -365,228 +368,32 @@ JDWP 握手可以成功**；超过这个窗口、App 挂起等待调试器之后
 - 结束时同样 `kill -9` 本地 jdb（不发 `quit`），并 `adb forward --remove`
   清理上游转发。
 
-完整可复现代码（在 `drive_jdb.py` 基础上重写，**推荐作为首选流程**；依赖与
-用法同 4.3 节，仅需 `pexpect`）：
+完整实现已作为仓库文件 `LynkCoHelper/tools/extract_appsecret.py` 提供（原名
+drive_jdb_proxy.py，初版的内嵌
+代码已移除，以仓库文件为准），并在初版基础上做了多处增强，把提取流程压缩成一条命令（用法详见第 7 节）：
 
-```python
-#!/usr/bin/env python3
-"""
-drive_jdb_proxy.py —— 本地 TCP 代理抢跑版密钥提取（首选方案）。
+1. 前置环境自动探测与下载：`pexpect` 缺失自动 pip 安装；`adb`（platform-tools
+   ~10MB）/ `jdb`（Amazon Corretto 8 ~110MB）缺失时确认后自动下载官方公开源
+   包到 `~/.lynkco-helper-tools/`；模拟器/AVD 仍需一次性手动安装（约 1.5GB
+   且需接受许可协议，见 7.1 节）；
+2. 无在线设备时自动列出并**冷启动** AVD（`-no-snapshot-load`，规避坑 1），
+   多个 AVD 时交互选择，也可通过命令行参数指定；
+3. 提取过程全自动（代理抢握手 -> suspend -> 断点 -> 单步探测 -> `kill -9`
+   收尾 -> 清理转发），中英文 jdb 输出均兼容；
+4. 提取成功后交互确认，可自动写入 `env.json` 的 `secrets` 段（该文件已被
+   gitignore，不会入库）；
+5. 命令同步采用"回显锚点 + 静默等待"：先等本条命令的回显出现（天然跳过
+   残留输出），再持续消费到 1 秒无新输出（兼容 jdb 异步事件——`next` 的
+   "已完成的步骤"会出现在早期 `> ` 提示符之后，只等第一个提示符会导致命令
+   输出整体错位一条），彻底避免输出错位；提取值格式校验（仅接受行尾
+   `= "..."` 的纯字母数字值，排除 `next` 步骤行等干扰），异常/断连自动
+   重试（最多 3 次）。
 
-背景：App 进入 waitForDebugger 阻塞态后，adbd 的 jdwp 转发握手会永久挂死
-（系统应用同样如此）；只有在 App 进程刚 fork、尚未执行到 waitForDebugger 的
-窗口期（约 0.5s 内）完成 JDWP 握手才能成功。jdb 是 JVM 冷启动 1-3s 赶不上，
-故由 Python 代理抢先握手。前置：模拟器必须 -no-snapshot-load 冷启动（坑1）。
+用法（依赖 `pexpect`）：
 
-用法: python3 drive_jdb_proxy.py
-注意：仅在本地临时使用，提取完成后应删除，密钥不应写入代码仓库。
-"""
-import os
-import shutil
-import socket
-import subprocess
-import sys
-import threading
-import time
-
-import pexpect
-
-ADB = os.path.expanduser("~/Library/Android/sdk/platform-tools/adb")
-CORRETTO8_JDB = os.path.expanduser(
-    "~/Library/Java/JavaVirtualMachines/amazon-corretto-8.jdk/Contents/Home/bin/jdb")
-# macOS 的 /usr/bin/jdb 只是桩，PATH 里没有真 jdb 时回退到用户级 Corretto 8
-JDB = "jdb" if shutil.which("jdb") and shutil.which("jdb") != "/usr/bin/jdb" else CORRETTO8_JDB
-
-APP = "com.lynkco.customer"
-ACTIVITY = "com.lynkco.customer/com.geely.lynkco.main.activity.LynkCoEntranceActivity"
-CLASS = "com.safe.cons.LynkCoConstants$g"
-
-PROXY_PORT = 8700      # jdb -> 代理
-UPSTREAM_PORT = 8701   # 代理 -> adb forward -> jdwp:<pid>
-
-BREAKPOINT_PATTERNS = ["Breakpoint hit", "断点命中"]
-EMPTY_VALUES = {"null", '""', "", "= null", "空值"}  # 必须含中文"空值"
-
-
-def adb(*args):
-    return subprocess.run([ADB, *args], capture_output=True, text=True).stdout.strip()
-
-
-class Proxy:
-    """jdb 先连上并挂起在握手阶段；等上游就绪后抢先握手并双向转发。"""
-
-    def __init__(self):
-        self.upstream_ready = threading.Event()
-        self.handshake_done = threading.Event()
-        self.status = "init"
-
-    def start_and_serve(self):
-        srv = socket.socket()
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", PROXY_PORT))
-        srv.listen(1)
-        # 1. 接受 jdb 连接，读取其握手请求并挂起
-        self.jdb_sock, _ = srv.accept()
-        hs = b""
-        while len(hs) < 14:
-            chunk = self.jdb_sock.recv(14 - len(hs))
-            if not chunk:
-                raise RuntimeError("jdb 在握手前断开")
-            hs += chunk
-        assert hs == b"JDWP-Handshake", hs
-        self.status = "jdb_connected"
-        srv.close()
-
-        # 2. 等主流程通知上游就绪
-        self.upstream_ready.wait(timeout=30)
-        # 3. 抢先连接上游（命中早期窗口）并完成握手
-        up = socket.socket()
-        up.settimeout(10)
-        up.connect(("127.0.0.1", UPSTREAM_PORT))
-        up.sendall(b"JDWP-Handshake")
-        echo = b""
-        while len(echo) < 14:
-            c = up.recv(14 - len(echo))
-            if not c:
-                raise RuntimeError("上游握手被关闭")
-            echo += c
-        assert echo == b"JDWP-Handshake"
-        up.settimeout(None)
-        self.up_sock = up
-        self.jdb_sock.sendall(echo)  # 把握手回显交给 jdb
-        self.handshake_done.set()
-        self.status = "relaying"
-
-        # 4. 双向转发
-        def pump(a, b):
-            try:
-                while True:
-                    data = a.recv(65536)
-                    if not data:
-                        break
-                    b.sendall(data)
-            except OSError:
-                pass
-            try:
-                b.shutdown(socket.SHUT_WR)
-            except OSError:
-                pass
-
-        t1 = threading.Thread(target=pump, args=(self.jdb_sock, up), daemon=True)
-        t2 = threading.Thread(target=pump, args=(up, self.jdb_sock), daemon=True)
-        t1.start(); t2.start()
-        t1.join(); t2.join()
-        self.status = "closed"
-
-
-def send_cmd(child, cmd, timeout=15):
-    child.sendline(cmd)
-    time.sleep(0.3)
-    try:
-        child.expect(["> ", pexpect.TIMEOUT], timeout=timeout)
-    except Exception:
-        pass
-    return child.before
-
-
-def main():
-    proxy = Proxy()
-    threading.Thread(target=proxy.start_and_serve, daemon=True).start()
-    time.sleep(0.3)  # 等代理开始监听
-
-    print(f"[*] Using jdb: {JDB}")
-    child = pexpect.spawn(f"{JDB} -attach {str(PROXY_PORT)}", timeout=60, encoding="utf-8")
-    child.logfile = sys.stdout
-
-    # 等 jdb 完成与代理的 TCP 连接（握手暂时挂起）
-    for _ in range(50):
-        if proxy.status in ("jdb_connected", "upstream_ready", "relaying"):
-            break
-        time.sleep(0.1)
-    print("\n[*] jdb 已连上代理（阻塞在握手），现在启动 App ...")
-
-    # 启动 App（等待调试器状态），进程一出现立刻建立 forward 并放行代理
-    adb("shell", f"am force-stop {APP}")
-    time.sleep(0.5)
-    adb("shell", "am", "start", "-D", "-n", ACTIVITY)
-    t0 = time.time()
-    pid = None
-    for _ in range(200):
-        out = adb("shell", f"pidof {APP}").strip()
-        if out and out.split()[0].isdigit():
-            pid = out.split()[0]
-            break
-        time.sleep(0.03)
-    if not pid:
-        print("[!] 未取到 App PID")
-        child.kill(9)
-        return
-    print(f"[*] PID={pid} (t={time.time()-t0:.2f}s)，立即建立转发 ...")
-    adb("forward", f"tcp:{UPSTREAM_PORT}", f"jdwp:{pid}")
-    proxy.upstream_ready.set()
-
-    if not proxy.handshake_done.wait(timeout=15):
-        print("[!] 上游握手失败（可能错过早期窗口）")
-        child.kill(9)
-        return
-    print("[+] JDWP 握手完成（命中早期窗口）！\n")
-
-    # 等 jdb 初始化完成出现提示符
-    try:
-        child.expect(["> ", pexpect.EOF, pexpect.TIMEOUT], timeout=30)
-    except Exception:
-        pass
-
-    # 尽快冻结 VM，最大限度赢得与 clinit 的竞速
-    print("\n[*] suspend")
-    send_cmd(child, "suspend", timeout=10)
-
-    print("\n[*] Setting breakpoint ...")
-    send_cmd(child, f"stop in {CLASS}.<clinit>")
-
-    print("\n[*] resume")
-    send_cmd(child, "resume", timeout=10)
-
-    idx = child.expect(BREAKPOINT_PATTERNS + [pexpect.EOF, pexpect.TIMEOUT], timeout=90)
-    if idx < len(BREAKPOINT_PATTERNS):
-        print("\n[+] Breakpoint hit!")
-        time.sleep(0.2)
-        try:
-            child.expect(["> ", pexpect.TIMEOUT], timeout=5)
-        except Exception:
-            pass
-        max_steps = 15
-        for i in range(max_steps):
-            print(f"\n[*] next (step {i + 1})")
-            send_cmd(child, "next", timeout=15)
-            out = send_cmd(child, f"print {CLASS}.c", timeout=10)
-            val_line = [l for l in out.splitlines() if "=" in l]
-            val = val_line[-1].split("=", 1)[-1].strip() if val_line else ""
-            print(f"    -> c probe: {val!r}")
-            if val and val not in EMPTY_VALUES:
-                break
-    else:
-        print("\n[!] 未命中断点（clinit 可能已提前执行），直接尝试打印字段 ...")
-
-    print("\n[*] Dumping fields b/c/d/e ...")
-    results = {}
-    for field in ["b", "c", "d", "e"]:
-        results[field] = send_cmd(child, f"print {CLASS}.{field}", timeout=10)
-
-    print("\n" + "=" * 60)
-    print("[RESULT]")
-    for field, out in results.items():
-        print(f"--- {field} raw output ---")
-        print(out)
-    print("=" * 60)
-
-    print("\n[*] Done. Killing local jdb with SIGKILL (NOT quit) ...")
-    child.kill(9)
-    adb("forward", "--remove", f"tcp:{UPSTREAM_PORT}")
-
-
-if __name__ == "__main__":
-    main()
+```bash
+python3 LynkCoHelper/tools/extract_appsecret.py            # 无设备时自动冷启动 AVD
+python3 LynkCoHelper/tools/extract_appsecret.py <AVD名字>  # 指定要冷启动的 AVD
 ```
 
 2026-08-25 实测：代理方案一次成功——PID 出现后 0.04s 内完成上游握手，
@@ -638,10 +445,10 @@ if __name__ == "__main__":
 - `NATIVE_APP_KEY` / `NATIVE_APP_SECRET` 是领克 App **应用级别**共用的密钥（不区分
   用户、不随登录状态变化），可在脚本里长期复用。
 - 若未来领克升级 App 并更换密钥（常见于大版本更新或更换加固方案时），签名会
-  重新返回 403，需重新执行第 4 节的流程提取，并按第 5 节验证。重新提取前请先
+  重新返回 403，需重新提取密钥（直接按第 7 节运行提取脚本），并按第 5 节验证。重新提取前请先
   确认第 3 节的前置条件（设备系统固件为 `userdebug`/`eng`）仍满足，否则需先
   换用模拟器或工程机。**注意 4.5 节的三个坑**：模拟器必须 `-no-snapshot-load`
-  冷启动（快照恢复会让 jdwp 转发挂死），且应优先使用 `drive_jdb_proxy.py`
+  冷启动（快照恢复会让 jdwp 转发挂死），且应优先使用 `tools/extract_appsecret.py`
   代理方案而非 4.3 节的直连流程（后者在 waitForDebugger 挂起态下握手不通）。
 - 若某个 App 版本调整了密钥调用链（类名/方法名/字段名混淆变化），需先重新做静态
   分析定位新的调用路径（参考第 1 节的分析思路）。
@@ -649,3 +456,71 @@ if __name__ == "__main__":
   `android:debuggable`，真正的前提是设备/模拟器系统固件为 `userdebug`/`eng`
   （详见第 3 节）。零售版真机（`user` 固件）无论是否 root 均无法直接使用本文档
   的方法，需改用 AVD 模拟器或对应固件的工程机。
+
+## 7. 一键提取（推荐）
+
+> 本节写给"密钥失效了，我只想重新提出密钥"的读者。脚本
+> `LynkCoHelper/tools/extract_appsecret.py` 会自动完成全部技术环节（依赖
+> 下载、冷启动模拟器、代理抢握手、断点提取、写入 env.json、失败重试），
+> **只有两件事必须手动做（各一次）**：创建模拟器、安装领克 App——它们各需
+> 约 1.5GB 下载且要图形界面/许可确认，自动化性价比极低。原理与踩坑细节见
+> 第 4 / 4.5 节；脚本失败先查 7.4 常见问题表。
+
+### 7.1 一次性手动准备（仅 2 步）
+
+1. **创建模拟器（AVD）**：安装 Android Studio（自带 SDK 管理器与模拟器）
+   → Device Manager → Create Virtual Device → 任选一款手机 → 系统镜像
+   **必须选 "Google APIs" 版本，不要选带 "Google Play" 的版本**（Play 版是
+   零售固件 `user`，不允许 JDWP 调试，是新手最常踩的坑）。API 31~34 的
+   Google APIs 镜像均可（userdebug 固件），实测 API 33。
+2. **安装领克 App**：从官网/应用商店/第三方 APK 站下载官方正式包
+   （`com.lynkco.customer`），把 `.apk` 文件**直接拖进模拟器窗口**即可安装。
+
+以下均**无需手动准备**，脚本自动处理：
+
+| 依赖 | 脚本行为 |
+|---|---|
+| `pexpect` | 缺失时自动 `pip install` |
+| `adb`（platform-tools ~10MB） | 缺失时询问并自动下载官方公开源到 `~/.lynkco-helper-tools/`（二次运行复用） |
+| `jdb`（JDK 8 ~110MB） | 同上（Amazon Corretto 8，自动匹配 macOS arm64/x64、Linux x64） |
+| 模拟器启动 | 无在线设备时自动 `-no-snapshot-load` **冷启动**（规避 4.5 节坑 1） |
+| 提取结果 | 成功后询问 `[y/N]`，确认则自动写入 `env.json`（已被 gitignore） |
+
+### 7.2 运行
+
+```bash
+# 仓库根目录执行；无在线设备时自动列出并冷启动 AVD（多个则交互选择）
+python3 LynkCoHelper/tools/extract_appsecret.py
+
+# 或指定 AVD
+python3 LynkCoHelper/tools/extract_appsecret.py <AVD名字>
+```
+
+预计耗时：首次（含下载依赖）约 5~10 分钟，之后每次约 1~2 分钟。脚本自动
+完成 4.5 节的全流程：代理抢握手 → suspend 冻结 → 断点 → 单步探测 →
+`kill -9` 收尾（不发 `quit`，避免触发 App 自杀）→ 清理端口转发；连接中断
+或提取值格式异常时自动重试，最多 3 次。
+
+### 7.3 验证结果
+
+成功后脚本会打印提取到的 `nativeAppKey` / `nativeAppSecret` 并询问是否写入
+`env.json` 的 `secrets` 段。之后跑一次任意任务（如
+`python3 lynkco_daily_tasks.py`）：
+
+- 不再返回 403 → 提取成功；
+- 仍 403 → 写入的值不对，或 App 已更换密钥调用链（类名变了），回到 7.4 排查；
+  需要离线严格验证可按第 5 节用历史抓包样本比对签名。
+
+### 7.4 常见问题速查
+
+| 脚本提示/现象 | 原因 | 处理 |
+|---|---|---|
+| `Activity class ... does not exist` | App 更新换了入口 Activity | `adb shell cmd package resolve-activity --brief com.lynkco.customer` 查输出最后一行的新 Activity 名，修改脚本头部 `ACTIVITY` 常量 |
+| `未取到 App PID` | App 没装上 | `adb shell pm list packages \| grep lynkco` 确认已安装，必要时重装 APK（见 7.1 第 2 步） |
+| `上游握手失败`（重试 3 次仍失败） | AVD 用了 Google Play 镜像，或模拟器以快照方式启动（4.5 节坑 1/坑 2） | 换 **Google APIs** 镜像重建 AVD（见 7.1 第 1 步）；若自己手动开过模拟器请关掉，让脚本自动冷启动（脚本自启的 AVD 必为冷启动） |
+| `未命中断点` / 提取值一直为空 | App 大版本更新、混淆类名变了 | 按第 1 节思路用新版 APK 重新静态分析，修改脚本头部 `CLASS` 常量；手动逐段定位可参考 4.3 节的 jdb 命令序列 |
+| `目标 VM 断开`（App 反调试自杀） | 调试暴露过久或平台连接不稳 | 脚本会自动重试；3 次均失败多为连接不稳，冷启动模拟器后重跑 |
+
+> 曾有的"手动 10 步教程"已随脚本完善而移除：手动直连依赖在进程 fork 后
+> 0.5s 内完成 JDWP 握手（4.5 节坑 2），多数环境人工根本赶不上，作为兜底
+> 反不如脚本可靠；需要理解每步在做什么，看 4.3 / 4.5 节的原理与命令序列。
