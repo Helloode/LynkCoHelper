@@ -20,8 +20,9 @@ macos-latest runner 实测路径：runner 预装 emulator/adb/JDK（直接复用
      - adb / jdb / emulator 缺失 -> 多镜像源自动下载官方公开源包
      - arm64-v8a API34 Google APIs 系统镜像缺失 -> 下载（约 1.2GB）、
        手工创建 AVD（无需 cmdline-tools）
-     - 硬件加速预检（Hypervisor.framework / kern.hv_support；下载前做，
-       避免下完镜像才发现起不来）
+     - 硬件加速检测（下载前做，避免白下镜像才发现起不来）：有 HVF 用
+       HVF；无 HVF（如 GitHub macos arm runner 是 VM）自动降级 qemu TCG
+       软件模拟（-accel off），boot 超时同步放宽
   2. 无在线设备时自动冷启动 AVD（-no-snapshot-load，规避快照导致的握手
      挂死；设 EMU_HEADLESS=1 切无头模式，适配 CI）
   3. 设备未装领克 App 时 -> 从领克官方 CDN 下载最新版 APK（约 285MB）
@@ -196,15 +197,28 @@ def _create_avd_manual(avd_name):
 
 
 def _ensure_acceleration():
-    """模拟器硬件加速预检（下载镜像前先确认能起，避免白下 ~1.2GB）：
-    macOS 查 Hypervisor.framework（kern.hv_support）。"""
+    """硬件加速检测：有 Hypervisor.framework 用 HVF（默认，不改环境）；
+    没有则降级 qemu TCG 纯软件模拟（设 EMU_ACCEL=off，由 core 的
+    cold_start_and_wait 转成 -accel off，boot 超时同步放宽）。
+
+    GitHub macOS arm64 runner 是 VM，guest 内无 HVF（官方确认短期无解，
+    actions/runner-images#13505），故 CI 上实际就是走 TCG——本机
+    emulator 36.6.11（与 runner 预装同版）实测 arm64 镜像 -accel off
+    冷启动 53s，完全可用，仅全程更慢。"""
     try:
         out = core.sh(["sysctl", "-n", "kern.hv_support"]).strip()
     except Exception:
         out = ""
-    if out != "1":
-        sys.exit("[!] 此 macOS 不支持 Hypervisor.framework（kern.hv_support != 1），"
-                 "无法硬件加速运行模拟器。")
+    hvf = out == "1"
+    forced = os.environ.get("EMU_ACCEL", "").lower() == "off"
+    if hvf and not forced:
+        return   # HVF 可用（物理 Mac 默认路径）
+    if forced:
+        print("[*] EMU_ACCEL=off，强制 qemu TCG 软件模拟（启动与运行更慢，属预期）")
+    else:
+        print("[*] 无 Hypervisor.framework（VM 内？），降级 qemu TCG 软件模拟"
+              "（启动与运行更慢，属预期）")
+    os.environ["EMU_ACCEL"] = "off"
 
 
 def ensure_emulator(existing_emu=None):
@@ -293,7 +307,7 @@ def ensure_device(wanted_avd=None):
         emu, avd = ensure_emulator()
         core.cold_start_and_wait(emu, avd)
         return
-    _ensure_acceleration()   # 有 emulator 也先查加速，缺了别白白等 8 分钟超时
+    _ensure_acceleration()   # 有 emulator 也先检测加速：无 HVF 则降级 TCG，别白等超时
     avds = core.sh([emu, "-list-avds"]).split()
     if not avds:
         # 复用已有 emulator，补齐镜像并创建 AVD

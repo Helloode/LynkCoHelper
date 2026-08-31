@@ -471,7 +471,10 @@ python3 LynkCoHelper/tools/extract_appsecret.py <AVD名字>  # 指定要冷启�
 > 执行 ARM 代码时其加固壳必崩（SIGSEGV，2026-08-31 ubuntu runner 实测），
 > 故 CI 必须用 arm64 runner（macos-latest），自动版已收敛为仅支持 macOS
 > Apple Silicon（Linux x86_64 路线已移除——必败路线不值得维护）；Intel
-> mac 同理只能用 arm64 真机。
+> mac 同理只能用 arm64 真机。另注：GitHub macOS arm runner 是 VM，
+> guest 内无 Hypervisor.framework（actions/runner-images#13505），脚本
+> 自动降级 qemu TCG 软件模拟（-accel off），冷启动实测可用（M4 Pro 53s，
+> runner 更慢但 boot 超时已放宽到 20 分钟）。
 >
 > 两者均自动完成：依赖下载、冷启动模拟器、代理抢握手、断点提取、写入
 > env.json、失败重试。原理与踩坑细节见第 4 / 4.5 节；脚本失败先查 7.4 常见问题表。
@@ -507,7 +510,9 @@ python3 LynkCoHelper/tools/extract_appsecret_auto.py
 ```
 
 环境变量（两个入口均生效）：`EMU_HEADLESS=1` 强制无头启动模拟器（CI 必设；
-本地默认窗口模式）；`LYNKCO_AUTO_WRITE=1` 免交互确认，直接写入 env.json。
+本地默认窗口模式）；`EMU_ACCEL=off` 强制 qemu TCG 软件模拟（无 HVF 的
+环境自动降级时脚本也会自己设）；`LYNKCO_AUTO_WRITE=1` 免交互确认，
+直接写入 env.json。
 
 CI 工作流另支持可选 Secret `LYNKCO_PAT`（具备本仓库 Secret 写权限的 PAT）：
 配置后提取结果会自动合并更新 `LYNKCO_APP_SECRETS` Secret，未配置时从

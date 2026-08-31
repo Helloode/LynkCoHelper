@@ -342,16 +342,23 @@ def ensure_apk():
 
 def cold_start_and_wait(emu, avd):
     """冷启动 AVD 并等 boot_completed。设 EMU_HEADLESS=1 或无 DISPLAY 的
-    Linux 自动切无头模式（CI/服务器场景）；macOS 保持窗口模式。"""
+    Linux 自动切无头模式（CI/服务器场景）；macOS 保持窗口模式。
+    设 EMU_ACCEL=off 则附加 -accel off（qemu TCG 纯软件模拟）：用于无
+    Hypervisor.framework 的环境（如 GitHub macOS arm64 runner），
+    此时启动/运行更慢，boot 超时同步放宽。"""
     headless = os.environ.get("EMU_HEADLESS") or \
         (sys.platform != "darwin" and not os.environ.get("DISPLAY"))
+    accel = os.environ.get("EMU_ACCEL", "").strip().lower()
     cmd = [emu, "-avd", avd, "-no-snapshot-load"]
+    if accel:
+        cmd += ["-accel", accel]
+    accel_note = "，TCG 软件模拟（无 HVF），更慢属预期" if accel == "off" else ""
     if headless:
         cmd += ["-no-window", "-gpu", "swiftshader_indirect",
                 "-no-audio", "-no-boot-anim"]
-        print(f"[*] 冷启动模拟器 {avd}（无头模式，约需 2~5 分钟）...")
+        print(f"[*] 冷启动模拟器 {avd}（无头模式{accel_note}，约需 2~5 分钟）...")
     else:
-        print(f"[*] 冷启动模拟器 {avd}（-no-snapshot-load，约需 1~2 分钟）...")
+        print(f"[*] 冷启动模拟器 {avd}（-no-snapshot-load{accel_note}，约需 1~2 分钟）...")
     env = os.environ.copy()
     sdk_root = os.path.dirname(os.path.dirname(emu))
     # 必须覆盖而非 setdefault：CI runner（如 GitHub ubuntu-latest）预设了
@@ -396,16 +403,20 @@ def cold_start_and_wait(emu, avd):
         subprocess.run([ADB, "wait-for-device"], capture_output=True, timeout=300)
     except subprocess.TimeoutExpired:
         _fail("adb 连接模拟器超时（5 分钟）")
-    for i in range(240):   # 最多等 8 分钟（CI 首次开机较慢）
+    # TCG 软模拟（-accel off）冷启动慢得多（GitHub macos arm runner 无 HVF
+    # 的实际路径），超时 8 -> 20 分钟；本机 M4 Pro 实测 TCG 53s，M1 VM 留足余量
+    boot_polls = 600 if accel == "off" else 240
+    for i in range(boot_polls):
         if adb("shell", "getprop", "sys.boot_completed").strip() == "1":
             print("[+] 模拟器启动完成")
-            time.sleep(5)  # 等 adbd / am 就绪，避免首轮 am start 拿不到 PID
+            # 等 adbd / am 就绪，避免首轮 am start 拿不到 PID（TCG 下更保守）
+            time.sleep(10 if accel == "off" else 5)
             return
         time.sleep(2)
         if i and i % 15 == 0:   # 每 30 秒一行心跳，CI 日志不静默
             print(f"[*] 仍在等待系统启动（已 {i * 2} 秒，"
                   f"模拟器日志 {TOOLS_DIR}/emulator.log）...")
-    _fail("模拟器启动超时（8 分钟）")
+    _fail(f"模拟器启动超时（{boot_polls * 2 // 60} 分钟）")
 
 
 # ---------------------------------------------------------------------------
@@ -654,7 +665,10 @@ def run_once():
                 print(f"    am start: {ln.strip()}")
         t0 = time.time()
         pid = None
-        for _ in range(300):   # 约 9s，冷启动后 App 起得慢也等得到
+        # 按 deadline 而非次数等：TCG 软模拟（CI 无 HVF）下 am start 拉起
+        # 进程明显更慢，且每次 adb 往返耗时不可控；出现即返回，等久不亏
+        pid_deadline = time.time() + 45
+        while time.time() < pid_deadline:
             out = adb("shell", f"pidof {APP}")
             out = out.strip()
             if out and out.split()[0].isdigit():
@@ -669,11 +683,11 @@ def run_once():
         adb("forward", f"tcp:{UPSTREAM_PORT}", f"jdwp:{pid}")
         proxy.upstream_ready.set()
 
-        # 新装 285MB App 首启需 dex 校验，模拟器负载高时 VM 达到等待调试器
-        # 状态可能较慢，给足 30 秒；但若上游连接失败（进程秒退，如加固壳
-        # 在 ARM 翻译层下必崩的 SIGSEGV，2026-08-31 CI 实测），立即失败
-        # 进入重试，不浪费整个超时窗口
-        deadline = time.time() + 30
+        # 新装 285MB App 首启需 dex 校验，模拟器负载高时（TCG 软模拟尤甚）
+        # VM 达到等待调试器状态可能较慢，给足 60 秒；但若上游连接失败
+        # （进程秒退，如加固壳在 ARM 翻译层下必崩的 SIGSEGV，2026-08-31
+        # CI 实测），立即失败进入重试，不浪费整个超时窗口
+        deadline = time.time() + 60
         while not proxy.handshake_done.is_set():
             if proxy.upstream_failed.is_set():
                 _dump_device_diagnostics("上游连接失败（App 进程大概率已退出）")
