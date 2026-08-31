@@ -475,18 +475,23 @@ python3 LynkCoHelper/tools/extract_appsecret.py <AVD名字>  # 指定要冷启�
 >    就是 arm64 Android，App 的加固壳跑真 ARM64 指令（逐条翻译），
 >    无 libndk 翻译层、不会崩溃；代价是慢（冷启动 20~50 分钟），
 >    boot 超时已放宽到 50 分钟，工作流 timeout 180 分钟。
->    ⚠️ Linux 上 emulator 必须**钉住 31.3.10**（build 8807927，脚本已固定
->    包名不经 XML 解析）：37.x 启动器硬性拒绝跨架构启动（run 33365171562
->    实测 FATAL "Avd's CPU Architecture 'arm64' is not supported by the
->    QEMU2 emulator on x86_64 host"——讽刺的是包里明明带着
->    qemu-system-aarch64）；31.3.10 无此检查，且当年这正是 Google 官方
->    支持的用法。镜像统一用 API 33 google_apis（arm64-v8a-33_r17.zip，
->    1.7GB，双镜像源均有），与 31.3.10 同时代且本地 Mac 验证过同一
->    API 级别。31.3.10 的 SDK 根校验还要求 platforms/ 子目录存在
->    （37.x 已不查，本地最小 SDK 实测复现/解除），脚本自建空目录
->    platforms/android-33/ 即可通过——启动只用 system-images，不读
->    platforms 内容。等待逻辑也已改为 5 秒一轮探测（进程存活 + 日志
->    PANIC/FATAL + adb get-state），秒级失败秒级退出，不再干等超时
+>    ⚠️ Linux 上 emulator 钉住 31.3.10（build 8807927，与 API33 镜像
+>    同代，脚本固定包名不经 XML 解析）。37.x 与 31.x 启动器均有跨架构
+>    硬检查（run 33365171562 / 33370599438 实测 FATAL "Avd's CPU
+>    Architecture 'arm64' is not supported by the QEMU2 emulator on
+>    x86_64 host"），但检查条件是「arm64 且 apiLevel≥28」：apiLevel
+>    只从 AVD 根 ini 的 target= 字段解析（avd/avd-info.c，与镜像
+>    build.prop 无交叉校验；CPU arch 则从镜像 build.prop 读，真
+>    arm64）——Linux 上把根 ini 的 target 谎报为 android-27（镜像仍
+>    是 API33）检查即不触发。本地用 CI 同版 31.3.10 实测：谎报
+>    target + API33 arm64 镜像正常 boot，guest 实为 Android 13。
+>    顺带 hw.sdCard=no 规避 arm 镜像 sdcard 老 bug（b/174481551）。
+>    镜像统一用 API 33 google_apis（arm64-v8a-33_r17.zip，
+>    1.7GB，双镜像源均有）。31.3.10 的 SDK 根校验还要求 platforms/
+>    子目录存在（37.x 已不查，本地最小 SDK 实测复现/解除），脚本自建
+>    空目录 platforms/android-33/ 即可通过——启动只用 system-images，
+>    不读 platforms 内容。等待逻辑也已改为 5 秒一轮探测（进程存活 +
+>    日志 PANIC/FATAL + adb get-state），秒级失败秒级退出，不再干等超时
 >    （run 33368243194 踩坑：启动 1 秒即 PANIC 却白等 adb 满 10 分钟）。
 > 已排除的路线（勿再踩）：ubuntu+x86_64 镜像（libndk 下加固壳必崩）；
 > macos runner——VM 内无 Hypervisor.framework（actions/runner-images#13505），
@@ -562,6 +567,7 @@ CI 工作流另支持可选 Secret `LYNKCO_PAT`（具备本仓库 Secret 写权�
 | `未命中断点` / 提取值一直为空 | App 大版本更新、混淆类名变了 | 按第 1 节思路用新版 APK 重新静态分析，修改脚本头部 `CLASS` 常量；手动逐段定位可参考 4.3 节的 jdb 命令序列 |
 | `目标 VM 断开`（App 反调试自杀） | 调试暴露过久或平台连接不稳 | 脚本会自动重试；3 次均失败多为连接不稳，冷启动模拟器后重跑 |
 | `PANIC: Broken AVD system path` | SDK 根缺 `platforms/` 子目录（31.3.10 校验，37.x 不查） | 脚本已自建空 `platforms/android-<API>/`；自备 SDK 时确保该目录存在 |
+| FATAL/PANIC "Avd's CPU Architecture 'arm64' is not supported ... on x86_64 host" | x86_64 宿主跑 arm64 镜像且 AVD 根 ini 的 target≥android-28 | 脚本已把 Linux 的 AVD target 谎报为 android-27 绕过检查（镜像仍是 API33）；自建 AVD 时同理 |
 | 模拟器启动失败（带 PANIC/FATAL 日志末尾） | 模拟器秒挂，等待逻辑 5 秒一轮探测即刻发现并带日志退出 | 看日志末尾的具体报错，对照本表或第 4.5 节踩坑记录排查 |
 
 > 曾有的"手动 10 步教程"已随脚本完善而移除：手动直连依赖在进程 fork 后

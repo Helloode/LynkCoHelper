@@ -81,10 +81,9 @@ if _IS_MAC:
     _PT_ZIP = "platform-tools-latest-darwin.zip"
     _CORRETTO_PKG = "amazon-corretto-8-aarch64-macos-jdk.tar.gz"
 else:
-    # Linux 必须钉住 31.3.10：37.x 启动器硬性拒绝跨架构（"Avd's CPU
-    # Architecture 'arm64' is not supported by the QEMU2 emulator on
-    # x86_64 host"，run 33365171562 实测）；31.3.10 无此检查且包内自带
-    # qemu-system-aarch64，x86_64 宿主跑 arm64 镜像走全系统 TCG（慢但稳）
+    # Linux：emulator 钉 31.3.10（与 API33 镜像同代，兼容性最好），跨架构
+    # 启动拒绝用 AVD 谎报 target=android-27 绕过（见 _create_avd_manual），
+    # qemu 全系统 TCG 模拟 arm64 guest，冷启动 20~50 分钟属预期
     _EMU_PKG_RE = r"(emulator-linux_x64-8807927\.zip)"
     _EMU_PKG_PIN = "emulator-linux_x64-8807927.zip"   # 31.3.10
     _EMU_MB = 280
@@ -199,17 +198,26 @@ def _make_executable(bin_dir):
 
 def _create_avd_manual(avd_name):
     """手工创建 AVD 配置（无需 cmdline-tools/avdmanager）。
-    AVD 本质就是 ~/.android/avd/<name>.ini + <name>.avd/config.ini。"""
+    AVD 本质就是 ~/.android/avd/<name>.ini + <name>.avd/config.ini。
+    Linux 上根 ini 的 target 谎报 android-27（实际镜像仍是 API33）：启动器
+    的跨架构检查是 "arm64 且 apiLevel>=28 才拒"（emulator/emulator/
+    main-emulator.cpp，31.x~当前 master 同款），apiLevel 只从根 ini 的
+    target= 解析（avd/avd-info.c，与镜像 build.prop 无交叉校验），
+    而 CPU arch 从镜像 build.prop 读（真 arm64）。本地用 CI 同版 31.3.10
+    实测：target=android-27 + API33 arm64 镜像正常 boot、guest 实为
+    Android 13。顺带 hw.sdCard=no 规避 arm 镜像附加 sdcard 的老 bug
+    （b/174481551：api>=30 时启动器本会跳过 sdcard，谎报 27 会重新踩上）。"""
     avd_home = os.environ.get("ANDROID_AVD_HOME",
                               os.path.join(os.path.expanduser("~"), ".android", "avd"))
     os.makedirs(avd_home, exist_ok=True)
     avd_dir = os.path.join(avd_home, f"{avd_name}.avd")
     os.makedirs(avd_dir, exist_ok=True)
+    target_api = "27" if not _IS_MAC else _API   # Linux 谎报，macOS 保持真实
     with open(os.path.join(avd_home, f"{avd_name}.ini"), "w", encoding="utf-8") as f:
         f.write("avd.ini.encoding=UTF-8\n")
         f.write(f"path={avd_dir}\n")
         f.write(f"path.rel=avd/{avd_name}.avd\n")
-        f.write(f"target=android-{_API}\n")
+        f.write(f"target=android-{target_api}\n")
     with open(os.path.join(avd_dir, "config.ini"), "w", encoding="utf-8") as f:
         f.write("avd.ini.encoding=UTF-8\n")
         f.write(f"image.sysdir.1=system-images/android-{_API}/google_apis/{_ABI}/\n")
@@ -225,6 +233,8 @@ def _create_avd_manual(avd_name):
         f.write("hw.keyboard=yes\n")
         f.write("hw.gpu.enabled=yes\n")
         f.write("hw.gpu.mode=auto\n")
+        if not _IS_MAC:
+            f.write("hw.sdCard=no\n")
         f.write("disk.dataPartition.size=6442450944\n")
     print(f"[+] 已创建 AVD: {avd_name}")
 
@@ -262,10 +272,9 @@ def _emu_supports_arm64_guests(emu):
 
 
 def _emu_allows_cross_arch(emu):
-    """Linux 复用本机 emulator 的版本护栏：37.x 起启动器硬性拒绝
-    arm64 AVD 在 x86_64 宿主上启动（run 33365171562 实测 FATAL）；
-    31.3.10（<32）无此检查。版本探测失败时保守返回 False（弃用，改用
-    钉住的 31.3.10 自下载包）。"""
+    """Linux 复用本机 emulator 的版本护栏：统一走钉住的 31.3.10（跨架构
+    启动靠 AVD 谎报 target 绕过，但仅在已验证的 31.3.10 上验证过；其他
+    版本不冒险）。版本探测失败时保守返回 False（弃用，改用自下载包）。"""
     try:
         out = core.sh([emu, "-version"])
     except Exception:
@@ -291,7 +300,7 @@ def ensure_emulator(existing_emu=None):
     elif existing_emu:
         why = ("不带 qemu-system-aarch64（无法承载 arm64 guest）"
                if not _emu_supports_arm64_guests(existing_emu)
-               else "≥ 32.x（会拒绝 arm64 AVD 跨架构启动）")
+               else "非 31.3.10（跨架构仅在 31.3.10 上验证过）")
         print(f"[*] 现有 emulator {why}，改用自下载的官方 emulator 包 ...")
     else:
         print("[*] 未找到 emulator，开始自动安装 ...")
