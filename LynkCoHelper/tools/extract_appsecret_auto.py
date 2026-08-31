@@ -329,8 +329,12 @@ def ensure_device(wanted_avd=None):
     _ensure_acceleration()   # 有 emulator 也先检测加速：无 HVF 则降级 TCG，别白等超时
     avds = core.sh([emu, "-list-avds"]).split()
     if not avds:
-        # 复用已有 emulator，补齐镜像并创建 AVD
-        _, avd = ensure_emulator(emu)
+        # 复用/自备 emulator，补齐镜像并创建 AVD。
+        # 必须用返回值：预装 emulator 缺 arm64 后端时 ensure_emulator 会
+        # 切换为自下载的 darwin_aarch64 包（run 33361068931 踩坑：丢弃
+        # 返回值导致仍用 x86_64 emulator + 镜像在另一 sdk 根，启动即
+        # PANIC "Broken AVD system path"）
+        emu, avd = ensure_emulator(emu)
         core.cold_start_and_wait(emu, avd)
         return
     if wanted_avd:
