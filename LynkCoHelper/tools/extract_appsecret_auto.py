@@ -235,7 +235,10 @@ def _create_avd_manual(avd_name):
         f.write("hw.gpu.mode=auto\n")
         if not _IS_MAC:
             f.write("hw.sdCard=no\n")
-        f.write("disk.dataPartition.size=6442450944\n")
+        # Linux/CI：userdata 2GB 足够（App 285MB 装后 <1GB）；runner 磁盘
+        # 紧张，6GB 分区 + 镜像 + 快照有爆盘风险。macOS 本地磁盘宽裕
+        # 维持 6GB（多留 App 数据余量）
+        f.write(f"disk.dataPartition.size={'2147483648' if not _IS_MAC else '6442450944'}\n")
     print(f"[+] 已创建 AVD: {avd_name}")
 
 

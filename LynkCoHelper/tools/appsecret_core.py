@@ -361,11 +361,15 @@ def cold_start_and_wait(emu, avd):
     （20~50 分钟），boot 超时已按平台放宽，心跳每 30 秒一行。"""
     headless = os.environ.get("EMU_HEADLESS") or \
         (sys.platform != "darwin" and not os.environ.get("DISPLAY"))
-    cmd = [emu, "-avd", avd, "-no-snapshot-load"]
+    # -no-snapshot-save：提取工具无需快照，退出更快更干净；也规避关机
+    # 保存快照被杀（run 33373332280：qemu 启动即走保存流程，20 秒不够
+    # 被 SIGKILL）。SLOW_VM 加 -verbose：CI 排障需要完整设备初始化日志
+    cmd = [emu, "-avd", avd, "-no-snapshot-load", "-no-snapshot-save"]
     if headless:
         cmd += ["-no-window", "-gpu", "swiftshader_indirect",
                 "-no-audio", "-no-boot-anim"]
         if SLOW_VM:
+            cmd += ["-verbose"]
             print(f"[*] 冷启动模拟器 {avd}（无头，全系统 TCG 模拟 arm64 镜像，"
                   "冷启动 20~50 分钟属预期）...")
         else:
@@ -409,8 +413,8 @@ def cold_start_and_wait(emu, avd):
         if os.path.exists(log_file):
             try:
                 with open(log_file, "rb") as f:
-                    lines = f.read()[-4000:].decode("utf-8", "replace").splitlines()
-                lines = [ln for ln in lines[-30:] if ln.strip()]
+                    lines = f.read()[-16000:].decode("utf-8", "replace").splitlines()
+                lines = [ln for ln in lines[-60:] if ln.strip()]
                 if lines:
                     print(f"[!] {reason}，emulator.log 末尾 {len(lines)} 行：")
                     for ln in lines:
