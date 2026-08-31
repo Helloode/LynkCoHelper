@@ -464,8 +464,14 @@ python3 LynkCoHelper/tools/extract_appsecret.py <AVD名字>  # 指定要冷启�
 >
 > | 入口 | 平台 | 特点 |
 > |---|---|---|
-> | `tools/extract_appsecret.py` | macOS | 常规本地使用，**仅一件事手动做（一次）**：创建模拟器；领克 App 自动下载安装 |
-> | `tools/extract_appsecret_linux.py` | Linux / CI | 一切全自动（含模拟器、APK），适合无人值守；GitHub Actions 手动触发见 `.github/workflows/extract-appsecret.yml` |
+> | `tools/extract_appsecret.py` | macOS（本地） | 常规本地使用，**仅一件事手动做（一次）**：创建模拟器；领克 App 自动下载安装 |
+> | `tools/extract_appsecret_auto.py` | CI / 无本地环境（仅 macOS arm64） | 一切全自动（含模拟器镜像、APK），适合无人值守；GitHub Actions 手动触发见 `.github/workflows/extract-appsecret.yml` |
+>
+> 架构硬约束：领克 APK 仅含 arm64-v8a 原生库，x86_64 模拟器靠 libndk 翻译
+> 执行 ARM 代码时其加固壳必崩（SIGSEGV，2026-08-31 ubuntu runner 实测），
+> 故 CI 必须用 arm64 runner（macos-latest），自动版已收敛为仅支持 macOS
+> Apple Silicon（Linux x86_64 路线已移除——必败路线不值得维护）；Intel
+> mac 同理只能用 arm64 真机。
 >
 > 两者均自动完成：依赖下载、冷启动模拟器、代理抢握手、断点提取、写入
 > env.json、失败重试。原理与踩坑细节见第 4 / 4.5 节；脚本失败先查 7.4 常见问题表。
@@ -484,7 +490,7 @@ Google APIs 镜像均可（userdebug 固件），实测 API 33。
 |---|---|
 | `pexpect` | 缺失时自动 `pip install` |
 | `adb`（platform-tools ~10MB） | 缺失时询问并自动下载官方公开源到 `~/.lynkco-helper-tools/`（二次运行复用） |
-| `jdb`（JDK 8 ~110MB） | 同上（Amazon Corretto 8，自动匹配 macOS arm64/x64、Linux x64） |
+| `jdb`（JDK 8 ~110MB） | 同上（Amazon Corretto 8 aarch64 macOS；本机已装任意 JDK 时直接复用其 jdb） |
 | 模拟器启动 | 无在线设备时自动 `-no-snapshot-load` **冷启动**（规避 4.5 节坑 1） |
 | 领克 App APK（约 285MB） | 设备未装时自动从领克官方 CDN 下载最新版并 `adb install`（已下载则复用） |
 | 提取结果 | 成功后询问 `[y/N]`，确认则自动写入 `env.json`（已被 gitignore） |
@@ -496,13 +502,12 @@ Google APIs 镜像均可（userdebug 固件），实测 API 33。
 python3 LynkCoHelper/tools/extract_appsecret.py
 python3 LynkCoHelper/tools/extract_appsecret.py <AVD名字>
 
-# Linux / CI（全自动：KVM 预检 -> 自动下载 emulator+镜像+APK -> 无头冷启动）
-python3 LynkCoHelper/tools/extract_appsecret_linux.py
+# 全自动版（CI / 无本地 Android 环境：加速预检 -> 自动下载镜像+APK -> 无头冷启动）
+python3 LynkCoHelper/tools/extract_appsecret_auto.py
 ```
 
-环境变量（两个入口均生效）：`EMU_HEADLESS=1` 强制无头启动模拟器（Linux 上
-无 DISPLAY 的服务器/CI 会自动切无头，无需手动设）；`LYNKCO_AUTO_WRITE=1`
-免交互确认，直接写入 env.json。
+环境变量（两个入口均生效）：`EMU_HEADLESS=1` 强制无头启动模拟器（CI 必设；
+本地默认窗口模式）；`LYNKCO_AUTO_WRITE=1` 免交互确认，直接写入 env.json。
 
 CI 工作流另支持可选 Secret `LYNKCO_PAT`（具备本仓库 Secret 写权限的 PAT）：
 配置后提取结果会自动合并更新 `LYNKCO_APP_SECRETS` Secret，未配置时从

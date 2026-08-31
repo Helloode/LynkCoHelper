@@ -1,44 +1,44 @@
 #!/usr/bin/env python3
 """
-extract_appsecret_linux.py —— Linux / CI 版：从零全自动提取领克 App 的
-nativeAppKey / nativeAppSecret（平台共享核心见 appsecret_core.py）。
+extract_appsecret_auto.py —— 全自动版（CI / 无本地 Android 环境的机器）：
+从零自动提取领克 App 的 nativeAppKey / nativeAppSecret。
 
-与 macOS 版（extract_appsecret.py）的差异：Linux 上一切皆自动，包括
-模拟器和领克 App 本体，适合无人值守环境（GitHub Actions ubuntu runner
-即开箱即用，见 .github/workflows/extract-appsecret.yml）。
+支持平台：仅 macOS Apple Silicon（arm64）——这是唯一可行的自动化路线。
+领克 APK 仅含 arm64-v8a 原生库，x86_64 模拟器靠 libndk 翻译执行 ARM
+代码时其加固壳必崩（SIGSEGV，2026-08-31 ubuntu runner 三次实测），
+Linux x86_64 路线已废弃（对领克 App 必败，维护无意义）。GitHub Actions
+macos-latest runner 实测路径：runner 预装 emulator/adb/JDK（直接复用），
+仅需下载 arm64-v8a API34 系统镜像（约 1.2GB）与 APK。
 
 用法（在仓库根目录执行，详见文档第 7 节）：
-  python3 LynkCoHelper/tools/extract_appsecret_linux.py            # 全自动
-  python3 LynkCoHelper/tools/extract_appsecret_linux.py <AVD名字>  # 指定 AVD
+  python3 LynkCoHelper/tools/extract_appsecret_auto.py            # 全自动
+  python3 LynkCoHelper/tools/extract_appsecret_auto.py <AVD名字>  # 指定 AVD
 
-Linux 全自动内容（核心流程与 macOS 版共用 appsecret_core.py）：
+全自动内容（核心流程与 macOS 版共用 appsecret_core.py）：
   1. 前置环境自动探测与下载（存 ~/.lynkco-helper-tools/，二次运行复用）：
-     - pexpect 缺失 -> 自动 pip 安装（Ubuntu 24.04 自动加 --break-system-packages）
-     - adb (platform-tools ~10MB) / jdb (Corretto 8 ~110MB) 缺失 ->
-       确认后自动下载官方公开源包（无需许可协议）
-     - emulator（~350MB）+ API34 Google APIs x86_64 系统镜像（~1.5GB）缺失 ->
-       多镜像源自动下载（dl.google.com 优先，腾讯云回退）、手工创建 AVD
-       （下载前先做 KVM 预检，/dev/kvm 缺失直接退出并给指引——这是 Linux
-       模拟器起不来的最常见原因）
-- 设备未装领克 App 时 -> 从领克官方 CDN 下载最新版 APK（约 285MB）
-  自动安装（与 macOS 版共用 core.ensure_apk）
+     - pexpect 缺失 -> 自动 pip 安装
+     - adb / jdb / emulator 缺失 -> 多镜像源自动下载官方公开源包
+     - arm64-v8a API34 Google APIs 系统镜像缺失 -> 下载（约 1.2GB）、
+       手工创建 AVD（无需 cmdline-tools）
+     - 硬件加速预检（Hypervisor.framework / kern.hv_support；下载前做，
+       避免下完镜像才发现起不来）
   2. 无在线设备时自动冷启动 AVD（-no-snapshot-load，规避快照导致的握手
-     挂死；设 EMU_HEADLESS=1 或无 DISPLAY 时自动切无头模式，适配 CI）
-  3. 代理抢握手 -> jdb 断点单步 -> 提取 b/c 字段
-  4. 提取成功后交互确认，可自动写入 env.json 的 secrets 段
+     挂死；设 EMU_HEADLESS=1 切无头模式，适配 CI）
+  3. 设备未装领克 App 时 -> 从领克官方 CDN 下载最新版 APK（约 285MB）
+     自动安装（与 macOS 版共用 core.ensure_apk）
+  4. 代理抢握手 -> jdb 断点单步 -> 提取 b/c 字段
+  5. 提取成功后交互确认，可自动写入 env.json 的 secrets 段
      （CI 场景设 LYNKCO_AUTO_WRITE=1 免确认，env.json 缺失时自动创建）
-  5. 连接中断（App 反调试自杀/平台不稳）或提取值格式异常时自动重试，最多 3 次
+  6. 连接中断（App 反调试自杀/平台不稳）或提取值格式异常时自动重试，
+     最多 3 次；失败时 dump 设备侧诊断（进程/ABI/logcat 崩溃缓冲）
 
 注意：密钥不应写入代码仓库（env.json 已被 gitignore）。
-架构限制：x86_64 专用（Google 未提供 Linux ARM64 的 emulator/系统镜像，
-Apple Silicon 容器内因无嵌套虚拟化也跑不了模拟器——Mac 上请用
-tools/extract_appsecret.py，模拟器跑宿主机、脚本可远程 adb connect）。
+本地 macOS 已有 Android Studio 环境时，交互友好的入口是
+tools/extract_appsecret.py。
 """
-import glob
 import os
 import platform
 import re
-import shutil
 import sys
 import zipfile
 import urllib.request
@@ -53,80 +53,29 @@ _PKG_MIRRORS = [
 
 _AVD_NAME = "lynkco_helper_avd"
 
-
-def find_adb():
-    """探测 adb：PATH -> ANDROID_HOME/SDK_ROOT -> Linux 默认位置 -> 工具目录。"""
-    p = shutil.which("adb")
-    if p:
-        return p
-    bases = [os.environ.get("ANDROID_HOME"), os.environ.get("ANDROID_SDK_ROOT"),
-             "~/Android/Sdk"]           # Linux + Android Studio 默认
-    for base in bases:
-        if not base:
-            continue
-        cand = os.path.join(os.path.expanduser(base), "platform-tools", "adb")
-        if os.path.exists(cand):
-            return cand
-    cand = os.path.join(core.TOOLS_DIR, "platform-tools", "adb")
-    return cand if os.path.exists(cand) else None
-
-
-def find_jdb():
-    """探测 jdb：JAVA_HOME -> PATH -> /usr/lib/jvm 等 Linux 常见路径
-    -> 本脚本工具目录（自动下载的 Corretto 8）。任意版本 JDK 均可
-    （jdb 走 JDWP 协议，与目标 JVM 版本无关）。"""
-    jh = os.environ.get("JAVA_HOME")
-    if jh:
-        cand = os.path.join(jh, "bin", "jdb")
-        if os.path.exists(cand):
-            return cand
-    p = shutil.which("jdb")
-    if p:   # Linux 的 /usr/bin/jdb 是 alternatives 真实链接，无需排除
-        return p
-    for pat in ("/usr/lib/jvm/*/bin/jdb",                      # Debian/Ubuntu/Fedora
-                os.path.expanduser("~/.jdks/*/bin/jdb"),       # IntelliJ IDEA
-                os.path.expanduser("~/.sdkman/candidates/java/*/bin/jdb")):
-        hits = sorted(glob.glob(pat))
-        if hits:
-            return hits[0]
-    hits = sorted(glob.glob(os.path.join(core.TOOLS_DIR, "jdk8", "**", "bin", "jdb"),
-                            recursive=True))
-    return hits[0] if hits else None
-
-
-def find_emulator():
-    p = shutil.which("emulator")
-    if p:
-        return p
-    for base in (os.environ.get("ANDROID_HOME"), os.environ.get("ANDROID_SDK_ROOT"),
-                 "~/Android/Sdk"):          # Linux + Android Studio 默认
-        if not base:
-            continue
-        cand = os.path.join(os.path.expanduser(base), "emulator", "emulator")
-        if os.path.exists(cand):
-            return cand
-    cand = os.path.join(core.TOOLS_DIR, "sdk", "emulator", "emulator")
-    return cand if os.path.exists(cand) else None
+# 平台参数（仅 macOS Apple Silicon 一条路，原因见文件头）
+_ABI = "arm64-v8a"
+_EMU_PKG_RE = r"(emulator-darwin_aarch64-\d+\.zip)"
+_SYSIMG_PKG_RE = r"(arm64-v8a-34_r\d+\.zip)"
+_SYSIMG_FALLBACK = "sys-img/google_apis/arm64-v8a-34_r14.zip"
+_PT_ZIP = "platform-tools-latest-darwin.zip"
+_CORRETTO_PKG = "amazon-corretto-8-aarch64-macos-jdk.tar.gz"
+_SYSIMG_MB = 1200
 
 
 def ensure_adb():
-    """探测 adb；缺失时经确认自动下载 Android platform-tools（官方公开源，
-    ~10MB，解压即用，无需许可协议）。"""
-    p = find_adb()
+    """探测 adb；缺失时自动下载 Android platform-tools（官方公开源，
+    ~10MB，解压即用，无需许可协议）。CI 的 macOS runner 已预装，直接复用。"""
+    p = core.find_adb()
     if p:
         return p
-    if platform.machine() == "aarch64":
-        # Google 未提供 Linux ARM64 的 platform-tools 包（本分支仅 x86_64）
-        sys.exit("[!] Linux ARM64 无官方 platform-tools 包，请先安装系统 adb："
-                 "Ubuntu/Debian: sudo apt install adb；然后重试。")
     dest = os.path.join(core.TOOLS_DIR, "platform-tools")
     if not core._confirm_download("adb (Android platform-tools)", 10, dest):
-        sys.exit("[!] 未找到 adb 且跳过下载。请设置 ANDROID_HOME 或 "
-                 "sudo apt install adb 后重试。")
+        sys.exit("[!] 未找到 adb 且跳过下载。请安装 Android Studio"
+                 "（文档 7.1 节）或 brew install android-platform-tools 后重试。")
     os.makedirs(core.TOOLS_DIR, exist_ok=True)
-    zip_name = "platform-tools-latest-linux.zip"
-    arc = os.path.join(core.TOOLS_DIR, zip_name)
-    core._download("https://dl.google.com/android/repository/" + zip_name, arc, 10)
+    arc = os.path.join(core.TOOLS_DIR, _PT_ZIP)
+    core._download("https://dl.google.com/android/repository/" + _PT_ZIP, arc, 10)
     with zipfile.ZipFile(arc) as z:
         z.extractall(core.TOOLS_DIR)
     os.remove(arc)
@@ -138,20 +87,20 @@ def ensure_adb():
 
 
 def ensure_jdb():
-    """探测 jdb；缺失时经确认自动下载 Amazon Corretto 8（官方公开源，
-    ~110MB，解压即用，无需许可协议）。"""
-    p = find_jdb()
+    """探测 jdb（任意版本 JDK 均可）；缺失时经确认自动下载 Amazon Corretto 8
+    （官方公开源，~110MB，解压即用，无需许可协议）。"""
+    p = core.find_jdb()
     if p:
         return p
     dest = os.path.join(core.TOOLS_DIR, "jdk8")
     if not core._confirm_download("jdb (Amazon Corretto 8 / JDK 8)", 110, dest):
-        sys.exit("[!] 未找到 jdb 且跳过下载。请安装 JDK（sudo apt install "
-                 "default-jdk 或设 JAVA_HOME）后重试。")
+        sys.exit("[!] 未找到 jdb 且跳过下载。请安装任意版本 JDK 后重试"
+                 "（如 brew install --cask corretto8；jdb 走 JDWP 协议，"
+                 "任意版本均可）。")
     os.makedirs(core.TOOLS_DIR, exist_ok=True)
-    arch = "aarch64" if platform.machine() == "aarch64" else "x64"
-    pkg_name = f"amazon-corretto-8-{arch}-linux-jdk.tar.gz"
-    arc = os.path.join(core.TOOLS_DIR, pkg_name)
-    core._download("https://corretto.aws/downloads/latest/" + pkg_name, arc, 110)
+    arc = os.path.join(core.TOOLS_DIR, _CORRETTO_PKG)
+    core._download("https://corretto.aws/downloads/latest/" + _CORRETTO_PKG,
+                   arc, 110)
     return core._extract_jdk_and_find_jdb(arc, dest)
 
 
@@ -163,20 +112,28 @@ def _fetch_latest_pkg_names():
     """从 Google repository XML 获取最新的 emulator 与 google_apis 系统镜像
     包名，返回 (emulator_pkg, sysimg_pkg)。两者分属不同 XML：emulator 在
     repository2-3.xml，系统镜像在 sys-img/google_apis/sys-img2-3.xml
-    （只在主 XML 里找镜像永远找不到）。单项失败不影响另一项。"""
+    （只在主 XML 里找镜像永远找不到）。单项失败不影响另一项。
+    同一包在 XML 中有多个通道（stable/beta/canary）各一块，只取 stable
+    （channel-0）——beta 包捆绑 android-sdk-preview-license，行为不可预期。"""
     def _grep(url, pattern):
         try:
             text = urllib.request.urlopen(url, timeout=30).read().decode("utf-8", "replace")
-            m = re.findall(pattern, text)
-            return m[-1] if m else None
         except Exception:
             return None
+        for block in re.findall(r"<remotePackage[^>]*>.*?</remotePackage>", text, re.S):
+            if 'ref="channel-0"' not in block:
+                continue
+            hits = re.findall(pattern, block)
+            if hits:
+                return hits[-1]
+        hits = re.findall(pattern, text)   # 无 stable 块时回退全文匹配
+        return hits[-1] if hits else None
 
     emu_pkg = _grep("https://dl.google.com/android/repository/repository2-3.xml",
-                    r"(emulator-linux_x64-\d+\.zip)")
+                    _EMU_PKG_RE)
     sysimg = _grep("https://dl.google.com/android/repository/"
                    "sys-img/google_apis/sys-img2-3.xml",
-                   r"(x86_64-34_r\d+\.zip)")
+                   _SYSIMG_PKG_RE)
     return emu_pkg, (f"sys-img/google_apis/{sysimg}" if sysimg else None)
 
 
@@ -221,11 +178,11 @@ def _create_avd_manual(avd_name):
         f.write("target=android-34\n")
     with open(os.path.join(avd_dir, "config.ini"), "w", encoding="utf-8") as f:
         f.write("avd.ini.encoding=UTF-8\n")
-        f.write("image.sysdir.1=system-images/android-34/google_apis/x86_64/\n")
+        f.write(f"image.sysdir.1=system-images/android-34/google_apis/{_ABI}/\n")
         f.write("tag.id=google_apis\n")
         f.write("tag.display=Google APIs\n")
-        f.write("abi.type=x86_64\n")
-        f.write("hw.cpu.arch=x86_64\n")
+        f.write(f"abi.type={_ABI}\n")
+        f.write("hw.cpu.arch=arm64\n")
         f.write("hw.cpu.ncore=4\n")
         f.write("hw.ramSize=2048\n")
         f.write("hw.lcd.width=1080\n")
@@ -238,23 +195,21 @@ def _create_avd_manual(avd_name):
     print(f"[+] 已创建 AVD: {avd_name}")
 
 
-def _ensure_kvm():
-    """Linux 上 x86_64 模拟器硬性依赖 KVM（同 Windows 必须 WHPX/AEHD）；
-    缺失时给出开启指引后退出，避免下载 1.9GB 后才发现起不来。"""
-    if os.path.exists("/dev/kvm"):
-        if os.access("/dev/kvm", os.R_OK | os.W_OK):
-            return
-        sys.exit("[!] /dev/kvm 存在但当前用户无权限。执行：\n"
-                 "    sudo usermod -aG kvm $USER  然后重新登录\n"
-                 "    （CI/容器可临时 sudo chmod 666 /dev/kvm）")
-    sys.exit("[!] 未找到 /dev/kvm：x86_64 模拟器必须 KVM 硬件加速。\n"
-             "    Ubuntu/Debian: sudo apt install qemu-kvm && sudo usermod -aG kvm $USER\n"
-             "    云主机/虚拟机需开启嵌套虚拟化；Docker 需启动参数 --device /dev/kvm")
+def _ensure_acceleration():
+    """模拟器硬件加速预检（下载镜像前先确认能起，避免白下 ~1.2GB）：
+    macOS 查 Hypervisor.framework（kern.hv_support）。"""
+    try:
+        out = core.sh(["sysctl", "-n", "kern.hv_support"]).strip()
+    except Exception:
+        out = ""
+    if out != "1":
+        sys.exit("[!] 此 macOS 不支持 Hypervisor.framework（kern.hv_support != 1），"
+                 "无法硬件加速运行模拟器。")
 
 
 def ensure_emulator(existing_emu=None):
-    """自动下载 emulator + 系统镜像并创建 AVD（约 1.9GB）。
-    返回 (emulator_path, avd_name)。下载前先做 KVM 预检。"""
+    """自动下载 emulator + 系统镜像并创建 AVD（镜像约 1.2~1.5GB）。
+    返回 (emulator_path, avd_name)。下载前先做硬件加速预检。"""
     if existing_emu:
         emu = existing_emu
         sdk_root = os.path.dirname(os.path.dirname(emu))
@@ -264,10 +219,10 @@ def ensure_emulator(existing_emu=None):
         os.makedirs(sdk_root, exist_ok=True)
         emu = os.path.join(sdk_root, "emulator", "emulator")
 
-    _ensure_kvm()
+    _ensure_acceleration()
 
     sysimg_dir = os.path.join(sdk_root, "system-images", "android-34",
-                              "google_apis", "x86_64")
+                              "google_apis", _ABI)
     emu_pkg, sysimg_pkg = None, None
     if not os.path.exists(emu) or not os.path.exists(sysimg_dir):
         emu_pkg, sysimg_pkg = _fetch_latest_pkg_names()
@@ -290,27 +245,27 @@ def ensure_emulator(existing_emu=None):
     if not os.path.exists(pt_dir):
         print("[*] 下载 platform-tools 到 SDK 目录 (~10MB)...")
         arc = os.path.join(core.TOOLS_DIR, "platform-tools-sdk.zip")
-        core._download("https://dl.google.com/android/repository/"
-                       "platform-tools-latest-linux.zip", arc, 10)
+        core._download("https://dl.google.com/android/repository/" + _PT_ZIP, arc, 10)
         with zipfile.ZipFile(arc) as z:
             z.extractall(sdk_root)
         os.remove(arc)
 
-    # 3. 系统镜像（约 1.5GB，API 34 Google APIs x86_64）
+    # 3. 系统镜像（API 34 Google APIs，ABI 见 _ABI）
     if not os.path.exists(sysimg_dir):
-        # 上次运行可能解压到错误位置（sdk_root/x86_64），先归位
-        wrong_dir = os.path.join(sdk_root, "x86_64")
+        # 上次运行可能解压到错误位置（sdk_root/<ABI>），先归位
+        wrong_dir = os.path.join(sdk_root, _ABI)
         if os.path.isdir(wrong_dir):
             os.makedirs(os.path.dirname(sysimg_dir), exist_ok=True)
             os.rename(wrong_dir, sysimg_dir)
             print(f"[+] 系统镜像已移到正确位置: {sysimg_dir}")
         else:
             if not sysimg_pkg:
-                sysimg_pkg = "sys-img/google_apis/x86_64-34_r14.zip"
+                sysimg_pkg = _SYSIMG_FALLBACK
                 print(f"[*] 未从 XML 取到镜像包名，使用已验证版本: {sysimg_pkg}")
-            print(f"[*] 下载系统镜像 ({sysimg_pkg}, 约 1.5GB)...")
-            # zip 内顶层是 x86_64/，解压到 google_apis/ 即得 google_apis/x86_64/
-            if not _download_and_extract(sysimg_pkg, os.path.dirname(sysimg_dir), 1500):
+            print(f"[*] 下载系统镜像 ({sysimg_pkg}, 约 {_SYSIMG_MB}MB)...")
+            # zip 内顶层是 <ABI>/，解压到 google_apis/ 即得 google_apis/<ABI>/
+            if not _download_and_extract(sysimg_pkg, os.path.dirname(sysimg_dir),
+                                         _SYSIMG_MB):
                 sys.exit("[!] 系统镜像下载失败，可手动下载解压到 "
                          f"{os.path.dirname(sysimg_dir)}/")
 
@@ -332,13 +287,13 @@ def ensure_device(wanted_avd=None):
         print(f"[*] 检测到在线设备：{online[0]}"
               "（若此前是快照方式启动且稍后握手挂死，请改用冷启动后重试，见文档 4.5 坑 1）")
         return
-    emu = find_emulator()
+    emu = core.find_emulator()
     if not emu:
-        # KVM 预检 + 自动下载 emulator/镜像 + 建 AVD
+        # 硬件加速预检 + 自动下载 emulator/镜像 + 建 AVD
         emu, avd = ensure_emulator()
         core.cold_start_and_wait(emu, avd)
         return
-    _ensure_kvm()   # 有 emulator 也先查 KVM，缺了别白白等 8 分钟超时
+    _ensure_acceleration()   # 有 emulator 也先查加速，缺了别白白等 8 分钟超时
     avds = core.sh([emu, "-list-avds"]).split()
     if not avds:
         # 复用已有 emulator，补齐镜像并创建 AVD
@@ -364,14 +319,12 @@ def ensure_device(wanted_avd=None):
 
 
 def main():
-    if sys.platform == "darwin":
-        sys.exit("[!] 本脚本是 Linux/CI 版，macOS 请用: "
-                 "LynkCoHelper/tools/extract_appsecret.py")
-    if sys.platform == "win32":
-        sys.exit("[!] 本脚本不支持 Windows（pexpect 依赖 POSIX 伪终端）。")
-    if platform.machine() == "aarch64":
-        sys.exit("[!] Linux ARM64 无官方 x86_64 模拟器镜像，且通常无嵌套虚拟化。"
-                 "请在 x86_64 Linux（物理机/CI runner）上运行。")
+    if sys.platform != "darwin" or platform.machine() != "arm64":
+        sys.exit("[!] 本自动版仅支持 macOS Apple Silicon（arm64）：领克 App 原生库"
+                 "仅 arm64-v8a，x86_64 模拟器的 ARM 翻译层（libndk）下其加固壳必崩"
+                 "（2026-08-31 ubuntu runner 实测），Linux/Intel mac 路线均已废弃。"
+                 "其他平台请改用 arm64 真机（adb 连接后跑本地版 "
+                 "tools/extract_appsecret.py）。")
     core.ensure_pexpect()
     core.setup(ensure_adb(), ensure_jdb())
     print(f"[*] adb: {core.ADB}")

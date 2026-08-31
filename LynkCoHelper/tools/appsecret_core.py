@@ -2,9 +2,10 @@
 """
 appsecret_core.py —— AppSecret 提取的平台无关共享核心（非入口，勿直接运行）。
 
-包含两个平台入口（macOS: extract_appsecret.py / Linux+CI:
-extract_appsecret_linux.py）共用的全部逻辑：
+包含两个平台入口（macOS 本地: extract_appsecret.py / CI·全自动:
+extract_appsecret_auto.py）共用的全部逻辑：
   - 常量与目标信息（App/Activity/断点类/端口/env.json 路径）
+  - 工具探测（find_adb / find_jdb / find_emulator，平台感知）
   - 下载工具（_download / _try_download / _confirm_download）
   - 领克 App 自动下载安装（ensure_apk，官方 CDN）
   - 冷启动 AVD 并等待 boot_completed（按平台自动选窗口/无头模式）
@@ -109,6 +110,85 @@ def sh(cmd):
 
 def adb(*args):
     return subprocess.run([ADB, *args], capture_output=True, text=True).stdout.strip()
+
+
+# ---------------------------------------------------------------------------
+# 工具探测（adb / jdb / emulator，全平台共用；各入口的 ensure_* 在此基础上
+# 补自动下载。jdb 任意版本 JDK 均可：走 JDWP 协议，与目标 JVM 版本无关）
+# ---------------------------------------------------------------------------
+
+def find_adb():
+    """探测 adb：PATH -> ANDROID_HOME/SDK_ROOT -> 平台默认 SDK 位置 -> 工具目录。"""
+    p = shutil.which("adb")
+    if p:
+        return p
+    bases = [os.environ.get("ANDROID_HOME"), os.environ.get("ANDROID_SDK_ROOT"),
+             "~/Library/Android/sdk" if sys.platform == "darwin" else "~/Android/Sdk"]
+    for base in bases:
+        if not base:
+            continue
+        cand = os.path.join(os.path.expanduser(base), "platform-tools", "adb")
+        if os.path.exists(cand):
+            return cand
+    cand = os.path.join(TOOLS_DIR, "platform-tools", "adb")
+    return cand if os.path.exists(cand) else None
+
+
+def find_jdb():
+    """探测 jdb。
+    macOS: java_home(-v 1.8) -> 已安装 JVM 目录 -> PATH（排除无 JDK 时的桩）
+    Linux: JAVA_HOME -> PATH（/usr/bin/jdb 是 alternatives 真实链接）
+    -> /usr/lib/jvm 等常见位置 -> 工具目录（自动下载的 Corretto 8）。"""
+    if sys.platform == "darwin":
+        try:
+            home = subprocess.run(["/usr/libexec/java_home", "-v", "1.8"],
+                                  capture_output=True, text=True).stdout.strip()
+            if home and os.path.exists(os.path.join(home, "bin", "jdb")):
+                return os.path.join(home, "bin", "jdb")
+        except Exception:
+            pass
+        for base in ("~/Library/Java/JavaVirtualMachines",   # macOS 用户级
+                     "/Library/Java/JavaVirtualMachines"):    # macOS 系统级
+            hits = sorted(glob.glob(os.path.expanduser(base) + "/*/Contents/Home/bin/jdb"))
+            if hits:
+                return hits[0]
+        p = shutil.which("jdb")
+        if p and p != "/usr/bin/jdb":   # macOS 的 /usr/bin/jdb 是无 JDK 时的桩
+            return p
+    else:
+        jh = os.environ.get("JAVA_HOME")
+        if jh and os.path.exists(os.path.join(jh, "bin", "jdb")):
+            return os.path.join(jh, "bin", "jdb")
+        p = shutil.which("jdb")
+        if p:
+            return p
+        for pat in ("/usr/lib/jvm/*/bin/jdb",                      # Debian/Ubuntu/Fedora
+                    os.path.expanduser("~/.jdks/*/bin/jdb"),        # IntelliJ IDEA
+                    os.path.expanduser("~/.sdkman/candidates/java/*/bin/jdb")):
+            hits = sorted(glob.glob(pat))
+            if hits:
+                return hits[0]
+    hits = sorted(glob.glob(os.path.join(TOOLS_DIR, "jdk8", "**", "bin", "jdb"),
+                            recursive=True))
+    return hits[0] if hits else None
+
+
+def find_emulator():
+    """探测 emulator：PATH -> ANDROID_HOME/SDK_ROOT -> 平台默认 SDK 位置
+    -> 工具目录（自动版下载的 sdk/emulator）。"""
+    p = shutil.which("emulator")
+    if p:
+        return p
+    bases = [os.environ.get("ANDROID_HOME"), os.environ.get("ANDROID_SDK_ROOT"),
+             "~/Library/Android/sdk" if sys.platform == "darwin" else "~/Android/Sdk"]
+    for base in bases:
+        if not base:
+            continue
+        cand = os.path.join(os.path.expanduser(base), "emulator", "emulator")
+        if os.path.exists(cand):
+            return cand
+    cand = os.path.join(TOOLS_DIR, "sdk", "emulator", "emulator")
+    return cand if os.path.exists(cand) else None
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +418,7 @@ class Proxy:
     def __init__(self):
         self.upstream_ready = threading.Event()
         self.handshake_done = threading.Event()
+        self.upstream_failed = threading.Event()   # 上游连接/握手失败（进程已死等）
         self.status = "init"
         self.aborted = False
 
@@ -377,7 +458,10 @@ class Proxy:
                 echo += c
             assert echo == b"JDWP-Handshake"
         except (OSError, RuntimeError, AssertionError):
-            return   # 已中止/上游异常：静默退出线程，由主流程重试
+            # 上游异常（jdwp 端口随进程退出而消失等）：标记失败，
+            # 由主流程立即终止本次尝试，不再傻等满超时
+            self.upstream_failed.set()
+            return
         up.settimeout(None)
         self.up_sock = up
         self.jdb_sock.sendall(echo)  # 把握手回显交给 jdb
@@ -586,11 +670,22 @@ def run_once():
         proxy.upstream_ready.set()
 
         # 新装 285MB App 首启需 dex 校验，模拟器负载高时 VM 达到等待调试器
-        # 状态可能较慢，给足 30 秒（原 15 秒在 2026-08-31 CI 实测不够）
-        if not proxy.handshake_done.wait(timeout=30):
-            _dump_device_diagnostics("上游握手失败")
-            raise Disconnected("上游握手失败（可能错过早期窗口）。"
-                               "若模拟器非冷启动，请按文档 4.5 节坑 1 冷启动后重试")
+        # 状态可能较慢，给足 30 秒；但若上游连接失败（进程秒退，如加固壳
+        # 在 ARM 翻译层下必崩的 SIGSEGV，2026-08-31 CI 实测），立即失败
+        # 进入重试，不浪费整个超时窗口
+        deadline = time.time() + 30
+        while not proxy.handshake_done.is_set():
+            if proxy.upstream_failed.is_set():
+                _dump_device_diagnostics("上游连接失败（App 进程大概率已退出）")
+                raise Disconnected("上游连接失败：App 进程已退出或 jdwp 未就绪。"
+                                   "若 CI 上反复出现，多为 APK 仅含 arm64-v8a"
+                                   "原生库，其加固壳在 x86_64 模拟器的 ARM"
+                                   "翻译层（libndk）下必崩，需改用 arm64 设备")
+            if time.time() > deadline:
+                _dump_device_diagnostics("上游握手超时")
+                raise Disconnected("上游握手失败（可能错过早期窗口）。"
+                                   "若模拟器非冷启动，请按文档 4.5 节坑 1 冷启动后重试")
+            time.sleep(0.2)
         print("[+] JDWP 握手完成（命中早期窗口）！\n")
 
         # 等 jdb 初始化完成出现提示符（两种形态："> " / "main[1] "）

@@ -13,7 +13,7 @@ nativeAppSecret（平台共享核心见 appsecret_core.py）。
   python3 LynkCoHelper/tools/extract_appsecret.py            # 无设备时自动冷启动 AVD
   python3 LynkCoHelper/tools/extract_appsecret.py <AVD名字>  # 指定要冷启动的 AVD
 
-macOS 自动化内容（核心流程与 Linux 版共用 appsecret_core.py）：
+macOS 自动化内容（核心流程与全自动版共用 appsecret_core.py）：
   1. pexpect 缺失 -> 自动 pip 安装
   2. adb (platform-tools ~10MB) / jdb (Corretto 8 ~110MB) 缺失 ->
      确认后自动下载官方公开源包到 ~/.lynkco-helper-tools/（无需许可协议）
@@ -25,80 +25,21 @@ macOS 自动化内容（核心流程与 Linux 版共用 appsecret_core.py）：
 
 注意：密钥不应写入代码仓库（env.json 已被 gitignore）。
 平台限制：仅模拟器/AVD 在 macOS 上需一次性手动创建（Android Studio 图形
-界面三步更可靠，见文档 7.1 节）；Linux/CI 连模拟器也全自动，见
-tools/extract_appsecret_linux.py。
+界面三步更可靠，见文档 7.1 节）；CI/无本地环境的全自动版（含模拟器
+镜像下载）见 tools/extract_appsecret_auto.py。
 """
-import glob
 import os
 import platform
-import shutil
-import subprocess
 import sys
 import zipfile
 
 import appsecret_core as core
 
 
-def find_adb():
-    """探测 adb：PATH -> ANDROID_HOME/SDK_ROOT -> macOS 默认位置 -> 工具目录。"""
-    p = shutil.which("adb")
-    if p:
-        return p
-    bases = [os.environ.get("ANDROID_HOME"), os.environ.get("ANDROID_SDK_ROOT"),
-             "~/Library/Android/sdk"]   # macOS + Android Studio 默认
-    for base in bases:
-        if not base:
-            continue
-        cand = os.path.join(os.path.expanduser(base), "platform-tools", "adb")
-        if os.path.exists(cand):
-            return cand
-    cand = os.path.join(core.TOOLS_DIR, "platform-tools", "adb")
-    return cand if os.path.exists(cand) else None
-
-
-def find_jdb():
-    """探测 jdb：java_home(-v 1.8) -> 已安装 JVM 目录 -> PATH（排除 macOS 桩）
-    -> 本脚本工具目录（自动下载的 Corretto 8）。"""
-    try:
-        home = subprocess.run(["/usr/libexec/java_home", "-v", "1.8"],
-                              capture_output=True, text=True).stdout.strip()
-        if home:
-            cand = os.path.join(home, "bin", "jdb")
-            if os.path.exists(cand):
-                return cand
-    except Exception:
-        pass
-    for base in ("~/Library/Java/JavaVirtualMachines",   # macOS 用户级
-                 "/Library/Java/JavaVirtualMachines"):   # macOS 系统级
-        hits = sorted(glob.glob(os.path.expanduser(base) + "/*/Contents/Home/bin/jdb"))
-        if hits:
-            return hits[0]
-    p = shutil.which("jdb")
-    if p and p != "/usr/bin/jdb":   # macOS 的 /usr/bin/jdb 是无 JDK 时的桩
-        return p
-    hits = sorted(glob.glob(os.path.join(core.TOOLS_DIR, "jdk8", "**", "bin", "jdb"),
-                            recursive=True))
-    return hits[0] if hits else None
-
-
-def find_emulator():
-    p = shutil.which("emulator")
-    if p:
-        return p
-    for base in (os.environ.get("ANDROID_HOME"), os.environ.get("ANDROID_SDK_ROOT"),
-                 "~/Library/Android/sdk"):   # macOS + Android Studio 默认
-        if not base:
-            continue
-        cand = os.path.join(os.path.expanduser(base), "emulator", "emulator")
-        if os.path.exists(cand):
-            return cand
-    return None
-
-
 def ensure_adb():
-    """探测 adb；缺失时经确认自动下载 Android platform-tools（官方公开源，
-    ~10MB，解压即用，无需许可协议）。"""
-    p = find_adb()
+    """探测 adb（core.find_adb）；缺失时经确认自动下载 Android platform-tools
+    （官方公开源，~10MB，解压即用，无需许可协议）。"""
+    p = core.find_adb()
     if p:
         return p
     dest = os.path.join(core.TOOLS_DIR, "platform-tools")
@@ -119,9 +60,9 @@ def ensure_adb():
 
 
 def ensure_jdb():
-    """探测 jdb；缺失时经确认自动下载 Amazon Corretto 8 / JDK 8（官方公开源，
-    ~110MB，解压即用，无需许可协议）。"""
-    p = find_jdb()
+    """探测 jdb（core.find_jdb）；缺失时经确认自动下载 Amazon Corretto 8 /
+    JDK 8（官方公开源，~110MB，解压即用，无需许可协议）。"""
+    p = core.find_jdb()
     if p:
         return p
     dest = os.path.join(core.TOOLS_DIR, "jdk8")
@@ -145,13 +86,13 @@ def ensure_device(wanted_avd=None):
         print(f"[*] 检测到在线设备：{online[0]}"
               "（若此前是快照方式启动且稍后握手挂死，请改用冷启动后重试，见文档 4.5 坑 1）")
         return
-    emu = find_emulator()
+    emu = core.find_emulator()
     if not emu:
         sys.exit("[!] 无在线设备且未找到 emulator。模拟器/AVD 需一次性手动安装："
                  "Android Studio -> Device Manager 创建（系统镜像选 Google APIs，"
                  "勿选 Google Play），步骤见文档 7.1 节。本脚本不自动下载它"
                  "（emulator + 系统镜像约 1.5GB 且需接受许可协议，手动装一次"
-                 "更可靠）。Linux/CI 的全自动版本见 extract_appsecret_linux.py。")
+                 "更可靠）。CI/无本地环境的全自动版本见 extract_appsecret_auto.py。")
     avds = core.sh([emu, "-list-avds"]).split()
     if not avds:
         sys.exit("[!] 无在线设备，也未找到任何 AVD。请先在 Android Studio 创建模拟器"
@@ -176,8 +117,8 @@ def ensure_device(wanted_avd=None):
 
 def main():
     if sys.platform != "darwin":
-        sys.exit(f"[!] 本脚本是 macOS 版（当前平台: {sys.platform}）。\n"
-                 "    Linux/CI 请用: LynkCoHelper/tools/extract_appsecret_linux.py")
+        sys.exit(f"[!] 本脚本是 macOS 本地版（当前平台: {sys.platform}）。\n"
+                 "    CI/无本地环境请用: LynkCoHelper/tools/extract_appsecret_auto.py")
     core.ensure_pexpect()
     core.setup(ensure_adb(), ensure_jdb())
     print(f"[*] adb: {core.ADB}")
