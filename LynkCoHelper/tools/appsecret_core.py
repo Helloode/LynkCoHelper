@@ -1,0 +1,582 @@
+#!/usr/bin/env python3
+"""
+appsecret_core.py —— AppSecret 提取的平台无关共享核心（非入口，勿直接运行）。
+
+包含两个平台入口（macOS: extract_appsecret.py / Linux+CI:
+extract_appsecret_linux.py）共用的全部逻辑：
+  - 常量与目标信息（App/Activity/断点类/端口/env.json 路径）
+  - 下载工具（_download / _try_download / _confirm_download）
+  - 领克 App 自动下载安装（ensure_apk，官方 CDN）
+  - 冷启动 AVD 并等待 boot_completed（按平台自动选窗口/无头模式）
+  - 本地 TCP 代理（抢先完成 JDWP 握手后双向转发，原理见文档 4.5 节）
+  - jdb 交互（send_cmd 回显锚点 + 静默等待同步策略）
+  - 字段解析与格式校验、env.json 写入（LYNKCO_AUTO_WRITE=1 免确认）
+  - 提取主循环（最多 3 次重试）
+拆分动机：此前 mac/win 两个脚本复制粘贴导致逻辑漂移（jdb 版本硬编码等），
+故核心收敛于此，平台差异只留在各自入口文件。
+"""
+import glob
+import json
+import os
+import platform
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tarfile
+import threading
+import time
+import urllib.request
+import zipfile
+
+try:
+    import pexpect
+except ImportError:
+    pexpect = None
+
+APP = "com.lynkco.customer"
+ACTIVITY = "com.lynkco.customer/com.geely.lynkco.main.activity.LynkCoEntranceActivity"
+CLASS = "com.safe.cons.LynkCoConstants$g"
+
+PROXY_PORT = 8700      # jdb -> 代理
+UPSTREAM_PORT = 8701   # 代理 -> adb forward -> jdwp:<pid>
+
+BREAKPOINT_PATTERNS = ["Breakpoint hit", "断点命中"]
+EMPTY_VALUES = {"null", '""', "", "= null", "空值"}
+# jdb 提示符两种形态：主提示符 "> "、断点命中后的线程提示符 "main[1] "。
+# 只匹配 "> " 会在断点命中后失同步，导致命令输出错位（上一条命令的残留
+# 被当成下一条的结果）。
+PROMPTS = ["> ", r"main\[\d+\] "]
+# 提取值应为纯字母数字串（实测 key 为 9 位数字、secret 为 32 位小写字母数字）
+VALUE_RE = re.compile(r"[0-9A-Za-z]{6,64}")
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# 脚本位于 tools/ 子目录，env.json 在上一级业务目录
+ENV_JSON = os.path.join(SCRIPT_DIR, "..", "env.json")
+ENV_EXAMPLE = os.path.join(SCRIPT_DIR, "..", "env.json.example")
+
+# 自动下载的前置工具安装位置（不污染项目目录；二次运行可直接复用）
+TOOLS_DIR = os.path.expanduser("~/.lynkco-helper-tools")
+
+MAX_ATTEMPTS = 3
+
+# 领克官方最新版本号查询接口（App 自动下载安装用，见 ensure_apk）
+LYNKCO_VER_API = "https://app-api-gw-toc.lynkco.com/app/newest/info"
+
+# 各入口探测完成后调用 setup() 注入，core 内的 adb()/run_once() 使用
+ADB = None
+JDB = None
+
+
+def setup(adb_path, jdb_path):
+    """入口脚本在探测/下载完成后调用，注入 adb / jdb 路径。"""
+    global ADB, JDB
+    ADB = adb_path
+    JDB = jdb_path
+
+
+def ensure_pexpect():
+    """pexpect 缺失时自动 pip 安装（仅本脚本进程内生效）。"""
+    global pexpect
+    if pexpect is not None:
+        return
+    print("[*] 缺少依赖 pexpect，自动安装中（pip install pexpect）...")
+    r = subprocess.run([sys.executable, "-m", "pip", "install", "pexpect"])
+    if r.returncode != 0:
+        # Ubuntu 23.04+/Debian 12+ 启用 PEP 668，pip 拒绝装到系统 Python，需附加参数
+        r = subprocess.run([sys.executable, "-m", "pip", "install",
+                            "--break-system-packages", "pexpect"])
+    if r.returncode != 0:
+        sys.exit("[!] pexpect 自动安装失败，请手动执行: "
+                 f"{sys.executable} -m pip install pexpect"
+                 "（Ubuntu/Debian 亦可用: sudo apt install python3-pexpect）")
+    import importlib
+    pexpect = importlib.import_module("pexpect")
+
+
+def sh(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+
+
+def adb(*args):
+    return subprocess.run([ADB, *args], capture_output=True, text=True).stdout.strip()
+
+
+# ---------------------------------------------------------------------------
+# 下载工具（两个平台入口共用）
+# ---------------------------------------------------------------------------
+
+def _download(url, dest_file, size_mb):
+    """下载文件并显示粗略进度。"""
+    print(f"[*] 下载 {url}（约 {size_mb}MB，视网络可能需数分钟）")
+    state = {"last": -1}
+
+    def hook(count, block, total):
+        pct = int(count * block * 100 / total) if total > 0 else 0
+        if pct != state["last"] and pct % 5 == 0:
+            state["last"] = pct
+            print(f"    {pct}%", end="\r")
+
+    try:
+        urllib.request.urlretrieve(url, dest_file, reporthook=hook)
+    except Exception as e:
+        if os.path.exists(dest_file):
+            os.remove(dest_file)
+        sys.exit(f"[!] 下载失败：{e}\n    可手动下载 {url} 解压到 {TOOLS_DIR} 后重跑")
+    print("    100% - 完成          ")
+
+
+def _try_download(url, dest_file, size_mb):
+    """尝试下载（软失败返回 False，供多镜像回退）。"""
+    print(f"[*] 尝试 {url}（约 {size_mb}MB）")
+    try:
+        resp = urllib.request.urlopen(url, timeout=60)
+    except Exception as e:
+        print(f"    [跳过] {e}")
+        return False
+    try:
+        with open(dest_file, "wb") as f:
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                f.write(chunk)
+    except Exception as e:
+        if os.path.exists(dest_file):
+            os.remove(dest_file)
+        print(f"    [失败] {e}")
+        return False
+    print("    - 完成")
+    return True
+
+
+def _confirm_download(kind, size_mb, dest):
+    try:
+        ans = input(f"[*] 未找到 {kind}，是否自动下载（约 {size_mb}MB -> {dest}）？[Y/n]: ")
+    except EOFError:
+        ans = "y"
+    return ans.strip().lower() != "n"
+
+
+def _extract_jdk_and_find_jdb(arc, dest):
+    """解压 JDK 压缩包并返回 jdb 路径（mac/linux ensure_jdb 共用）。"""
+    os.makedirs(dest, exist_ok=True)
+    if zipfile.is_zipfile(arc):
+        with zipfile.ZipFile(arc) as z:
+            z.extractall(dest)
+        os.remove(arc)
+    else:
+        with tarfile.open(arc) as t:
+            t.extractall(dest)
+        os.remove(arc)
+    hits = sorted(glob.glob(os.path.join(dest, "**", "bin", "jdb"), recursive=True))
+    if not hits:
+        sys.exit(f"[!] 解压后未找到 jdb，请检查 {dest}")
+    return hits[0]
+
+
+def ensure_apk():
+    """设备未装领克 App 时自动安装（平台无关）：查询官方接口拿最新
+    版本号，从领克官方 CDN 下载（约 285MB，已下载则复用）后 adb install。"""
+    if adb("shell", "pm", "path", APP).strip():
+        return
+    try:
+        data = json.loads(urllib.request.urlopen(LYNKCO_VER_API, timeout=15).read())
+        ver = (data.get("data") or {}).get("androidNewestVersion", "").lstrip("V")
+    except Exception:
+        ver = ""
+    if not ver:
+        sys.exit(f"[!] 设备上未安装 {APP} 且无法查询最新版本号，请手动安装后重试")
+    apk = os.path.join(TOOLS_DIR, f"lynkco-v{ver}.apk")
+    if not os.path.exists(apk):
+        if not _confirm_download(f"领克 App v{ver} APK", 285, apk):
+            sys.exit("[!] 未安装 App 且跳过下载，退出。")
+        os.makedirs(TOOLS_DIR, exist_ok=True)
+        _download(f"https://app-cdn.lynkco.com/android/lynkco-64-v{ver}.apk",
+                  apk, 285)
+    print(f"[*] 安装 APK: {apk}")
+    out = adb("install", "-r", apk)
+    if out:
+        print(f"    {out.splitlines()[-1]}")
+    if not adb("shell", "pm", "path", APP).strip():
+        sys.exit(f"[!] APK 安装后仍未检测到 {APP}，请人工检查")
+
+
+# ---------------------------------------------------------------------------
+# 冷启动 AVD（按平台自动选窗口 / 无头模式）
+# ---------------------------------------------------------------------------
+
+def cold_start_and_wait(emu, avd):
+    """冷启动 AVD 并等 boot_completed。设 EMU_HEADLESS=1 或无 DISPLAY 的
+    Linux 自动切无头模式（CI/服务器场景）；macOS 保持窗口模式。"""
+    headless = os.environ.get("EMU_HEADLESS") or \
+        (sys.platform != "darwin" and not os.environ.get("DISPLAY"))
+    cmd = [emu, "-avd", avd, "-no-snapshot-load"]
+    if headless:
+        cmd += ["-no-window", "-gpu", "swiftshader_indirect",
+                "-no-audio", "-no-boot-anim"]
+        print(f"[*] 冷启动模拟器 {avd}（无头模式，约需 2~5 分钟）...")
+    else:
+        print(f"[*] 冷启动模拟器 {avd}（-no-snapshot-load，约需 1~2 分钟）...")
+    env = os.environ.copy()
+    sdk_root = os.path.dirname(os.path.dirname(emu))
+    env.setdefault("ANDROID_HOME", sdk_root)
+    env.setdefault("ANDROID_SDK_ROOT", sdk_root)
+    if sys.platform == "darwin":
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        log_file = os.path.join(TOOLS_DIR, "emulator.log")
+        with open(log_file, "wb") as lf:
+            subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, env=env)
+    try:
+        subprocess.run([ADB, "wait-for-device"], capture_output=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        sys.exit("[!] adb 连接模拟器超时（5 分钟），"
+                 f"日志见 {TOOLS_DIR}/emulator.log")
+    for _ in range(240):   # 最多等 8 分钟（CI 首次开机较慢）
+        if adb("shell", "getprop", "sys.boot_completed").strip() == "1":
+            print("[+] 模拟器启动完成")
+            time.sleep(5)  # 等 adbd / am 就绪，避免首轮 am start 拿不到 PID
+            return
+        time.sleep(2)
+    sys.exit("[!] 模拟器启动超时，请手动冷启动后重试。")
+
+
+# ---------------------------------------------------------------------------
+# JDWP 代理 + jdb 交互 + 字段解析（平台无关）
+# ---------------------------------------------------------------------------
+
+class Proxy:
+    """jdb 先连上并挂起在握手阶段；等上游就绪后抢先握手并双向转发。"""
+
+    def __init__(self):
+        self.upstream_ready = threading.Event()
+        self.handshake_done = threading.Event()
+        self.status = "init"
+        self.aborted = False
+
+    def start_and_serve(self):
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", PROXY_PORT))
+        srv.listen(1)
+        # 1. 接受 jdb 连接，读取其握手请求并挂起
+        self.jdb_sock, _ = srv.accept()
+        self.jdb_sock.settimeout(None)
+        hs = b""
+        while len(hs) < 14:
+            chunk = self.jdb_sock.recv(14 - len(hs))
+            if not chunk:
+                raise RuntimeError("jdb 在握手前断开")
+            hs += chunk
+        assert hs == b"JDWP-Handshake", hs
+        self.status = "jdb_connected"
+        srv.close()
+
+        # 2. 等主流程通知上游就绪
+        self.upstream_ready.wait(timeout=30)
+        if self.aborted:
+            return
+        # 3. 抢先连接上游（命中早期窗口）并完成握手
+        try:
+            up = socket.socket()
+            up.settimeout(10)
+            up.connect(("127.0.0.1", UPSTREAM_PORT))
+            up.sendall(b"JDWP-Handshake")
+            echo = b""
+            while len(echo) < 14:
+                c = up.recv(14 - len(echo))
+                if not c:
+                    raise RuntimeError("上游握手被关闭")
+                echo += c
+            assert echo == b"JDWP-Handshake"
+        except (OSError, RuntimeError, AssertionError):
+            return   # 已中止/上游异常：静默退出线程，由主流程重试
+        up.settimeout(None)
+        self.up_sock = up
+        self.jdb_sock.sendall(echo)  # 把握手回显交给 jdb
+        self.handshake_done.set()
+        self.status = "relaying"
+
+        # 4. 双向转发
+        def pump(a, b):
+            try:
+                while True:
+                    data = a.recv(65536)
+                    if not data:
+                        break
+                    b.sendall(data)
+            except OSError:
+                pass
+            try:
+                b.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+        t1 = threading.Thread(target=pump, args=(self.jdb_sock, up), daemon=True)
+        t2 = threading.Thread(target=pump, args=(up, self.jdb_sock), daemon=True)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+        self.status = "closed"
+
+    def close(self):
+        """中止代理线程并释放套接字（重试前清理旧代理）。"""
+        self.aborted = True
+        self.upstream_ready.set()
+        for s in (getattr(self, "jdb_sock", None), getattr(self, "up_sock", None)):
+            try:
+                if s:
+                    s.close()
+            except OSError:
+                pass
+        self.status = "closed"
+
+
+class Disconnected(Exception):
+    """jdb 与目标 VM 的连接中断（App 反调试自杀或平台连接不稳），可重试。"""
+
+
+def send_cmd(child, cmd, timeout=15):
+    """向 jdb 发送命令并收集本条命令的输出。
+
+    同步策略（修复命令输出错位）：
+    1. 回显锚点——先等到本条命令的回显出现，天然跳过缓冲区里上一条
+       命令的残留输出；
+    2. 静默等待——jdb 会异步输出事件（典型：next 的"已完成的步骤"出现在
+       早期 "> " 提示符之后），只等第一个提示符会提前返回、把事件文本
+       留给下一条命令误捕获，造成整体错位一条。故持续消费到 1 秒无新
+       输出为止。
+    连接中断时抛 Disconnected，由主循环统一重试。
+    """
+    try:
+        child.sendline(cmd)
+        child.expect(re.escape(cmd), timeout=timeout)   # 锚点：本条回显
+    except pexpect.EOF:
+        raise Disconnected("jdb 已退出（EOF）")
+    except (pexpect.TIMEOUT, OSError) as e:
+        raise Disconnected(f"等待命令回显失败（{cmd!r}）：{e}")
+
+    parts = []
+    first = True
+    while True:
+        try:
+            idx = child.expect(PROMPTS + [pexpect.EOF, pexpect.TIMEOUT],
+                               timeout=timeout if first else 1)
+        except OSError as e:
+            raise Disconnected(f"读取 jdb 输出失败（{e}）")
+        if idx == len(PROMPTS):            # EOF：jdb 退出
+            raise Disconnected("jdb 已退出（EOF）")
+        if idx == len(PROMPTS) + 1:        # 静默：本条命令输出结束
+            break
+        parts.append(child.before or "")
+        first = False
+    out = "\n".join(p for p in parts if p.strip())
+    if "已断开连接" in out or "disconnected" in out.lower():
+        raise Disconnected("目标 VM 断开（App 反调试自杀或平台连接中断）")
+    return out
+
+
+def parse_field(out):
+    """从 jdb print 输出中解析字段值；未赋值/失败返回 None。
+
+    只接受行尾 `= "..."` 形式的带引号字符串值：jdb 未赋值时打印 `空值`/
+    `null`（无引号）；`next` 的"已完成的步骤: \"线程=main\", ..."等行
+    虽含 "=" 但值不带引号，均会被正确排除。
+    """
+    for line in out.splitlines():
+        m = re.search(r'=\s*"([^"]+)"\s*$', line.strip())
+        if m and m.group(1) not in EMPTY_VALUES:
+            return m.group(1)
+    return None
+
+
+def looks_valid(v):
+    """提取值格式校验：纯字母数字串（key=9 位数字，secret=32 位字母数字）。"""
+    return bool(v) and VALUE_RE.fullmatch(v) is not None
+
+
+def maybe_write_env(key, secret):
+    """交互确认后，把提取结果写入 env.json 的 secrets 段。
+    设 LYNKCO_AUTO_WRITE=1（CI 场景）免确认，且 env.json 不存在时自动创建。"""
+    auto = os.environ.get("LYNKCO_AUTO_WRITE") == "1"
+    if not auto:
+        try:
+            ans = input("\n是否把上述两个值自动写入 env.json？[y/N]: ").strip().lower()
+        except EOFError:
+            ans = ""
+        if ans != "y":
+            print("[*] 未写入，请自行保存。")
+            return
+    if os.path.exists(ENV_JSON):
+        with open(ENV_JSON, encoding="utf-8") as f:
+            env = json.load(f)
+    elif auto:
+        env = {}   # CI：env.json 未入库（gitignore），直接创建仅含 secrets 的文件
+    else:
+        hint = (f"请先复制 {ENV_EXAMPLE} 为 env.json 并填入账号后重跑"
+                if os.path.exists(ENV_EXAMPLE) else "请手动创建该文件")
+        print(f"[!] {ENV_JSON} 不存在：{hint}，或手动填入上述值。")
+        return
+    env.setdefault("secrets", {})
+    env["secrets"]["nativeAppKey"] = key
+    env["secrets"]["nativeAppSecret"] = secret
+    with open(ENV_JSON, "w", encoding="utf-8") as f:
+        json.dump(env, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    print(f"[+] 已写入 {ENV_JSON}（该文件已被 gitignore，不会入库）")
+
+
+# ---------------------------------------------------------------------------
+# 单次提取 + 主循环（平台无关）
+# ---------------------------------------------------------------------------
+
+def run_once():
+    """单次完整提取；连接类故障抛 Disconnected 交由主循环重试。返回 (key, secret)。"""
+    proxy = Proxy()
+    threading.Thread(target=proxy.start_and_serve, daemon=True).start()
+    time.sleep(0.3)  # 等代理开始监听
+    child = None
+    try:
+        print(f"[*] Using jdb: {JDB}")
+        child = pexpect.spawn(f"{shlex.quote(JDB)} -attach {PROXY_PORT}",
+                              timeout=60, encoding="utf-8")
+        child.logfile = sys.stdout
+
+        # 等 jdb 完成与代理的 TCP 连接（握手暂时挂起）
+        for _ in range(50):
+            if proxy.status in ("jdb_connected", "upstream_ready", "relaying"):
+                break
+            time.sleep(0.1)
+        print("\n[*] jdb 已连上代理（阻塞在握手），现在启动 App ...")
+
+        # 启动 App（等待调试器状态），进程一出现立刻建立 forward 并放行代理
+        adb("shell", "am", "force-stop", APP)
+        time.sleep(0.5)
+        adb("shell", "am", "start", "-D", "-n", ACTIVITY)
+        t0 = time.time()
+        pid = None
+        for _ in range(300):   # 约 9s，冷启动后 App 起得慢也等得到
+            out = adb("shell", f"pidof {APP}")
+            out = out.strip()
+            if out and out.split()[0].isdigit():
+                pid = out.split()[0]
+                break
+            time.sleep(0.03)
+        if not pid:
+            raise Disconnected("未取到 App PID：请确认模拟器已安装领克 App"
+                               "（adb shell pm list packages | grep lynkco）")
+        print(f"[*] PID={pid} (t={time.time()-t0:.2f}s)，立即建立转发 ...")
+        adb("forward", f"tcp:{UPSTREAM_PORT}", f"jdwp:{pid}")
+        proxy.upstream_ready.set()
+
+        if not proxy.handshake_done.wait(timeout=15):
+            raise Disconnected("上游握手失败（可能错过早期窗口）。"
+                               "若模拟器非冷启动，请按文档 4.5 节坑 1 冷启动后重试")
+        print("[+] JDWP 握手完成（命中早期窗口）！\n")
+
+        # 等 jdb 初始化完成出现提示符（两种形态："> " / "main[1] "）
+        try:
+            child.expect(PROMPTS + [pexpect.EOF, pexpect.TIMEOUT], timeout=30)
+        except Exception:
+            pass
+
+        # 尽快冻结 VM，最大限度赢得与 clinit 的竞速
+        print("\n[*] suspend")
+        send_cmd(child, "suspend", timeout=10)
+
+        print("\n[*] Setting breakpoint ...")
+        send_cmd(child, f"stop in {CLASS}.<clinit>")
+
+        print("\n[*] resume")
+        try:
+            child.sendline("resume")
+        except OSError as e:
+            raise Disconnected(f"jdb 进程已退出（{e}）")
+        # resume 后断点事件（"设置延迟的断点/断点命中"）会异步到达，这里
+        # 不能用 send_cmd（其静默等待可能提前吞掉断点事件），直接等断点文本。
+        idx = child.expect(BREAKPOINT_PATTERNS + [pexpect.EOF, pexpect.TIMEOUT],
+                           timeout=90)
+        if idx == len(BREAKPOINT_PATTERNS):
+            raise Disconnected("等待断点期间 jdb 已退出（EOF）")
+        if idx < len(BREAKPOINT_PATTERNS):
+            print("\n[+] Breakpoint hit!")
+            time.sleep(0.2)
+            try:
+                child.expect(PROMPTS + [pexpect.TIMEOUT], timeout=5)
+            except Exception:
+                pass
+            for i in range(15):
+                print(f"\n[*] next (step {i + 1})")
+                send_cmd(child, "next", timeout=15)
+                out = send_cmd(child, f"print {CLASS}.c", timeout=10)
+                val = parse_field(out)
+                print(f"    -> c probe: {val!r}")
+                if val:
+                    break
+        else:
+            print("\n[!] 未命中断点（clinit 可能已提前执行），直接尝试打印字段 ...")
+
+        print("\n[*] Dumping fields b/c/d/e ...")
+        results = {}
+        for field in ["b", "c", "d", "e"]:
+            results[field] = send_cmd(child, f"print {CLASS}.{field}", timeout=10)
+
+        print("\n" + "=" * 60)
+        print("[RESULT]")
+        for field, out in results.items():
+            print(f"--- {field} raw output ---")
+            print(out)
+        print("=" * 60)
+
+        return parse_field(results.get("b", "")), parse_field(results.get("c", ""))
+    finally:
+        print("\n[*] Killing local jdb with SIGKILL (NOT quit) ...")
+        if child is not None:
+            try:
+                child.kill(9)
+            except Exception:
+                pass
+        proxy.close()
+        try:
+            adb("forward", "--remove", f"tcp:{UPSTREAM_PORT}")
+        except Exception:
+            pass
+
+
+def extract_main_loop():
+    """提取主循环：调用前需已 setup(adb, jdb) 且设备就绪。"""
+    key = secret = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            print(f"\n========== 第 {attempt}/{MAX_ATTEMPTS} 次尝试 ==========")
+            key, secret = run_once()
+            if looks_valid(key) and looks_valid(secret):
+                break
+            # 解析出了值但格式异常（含空格/中文/引号等）——多为 jdb 输出错位
+            print(f"\n[!] 第 {attempt} 次提取的值格式异常（疑似 jdb 输出不同步）：")
+            print(f"    nativeAppKey    = {key!r}")
+            print(f"    nativeAppSecret = {secret!r}")
+            key = secret = None
+            if attempt < MAX_ATTEMPTS:
+                print("[*] 3 秒后自动重试（将重新 force-stop 并启动 App）...")
+                time.sleep(3)
+        except Disconnected as e:
+            print(f"\n[!] 第 {attempt} 次尝试失败：{e}")
+            if attempt < MAX_ATTEMPTS:
+                print("[*] 3 秒后自动重试（将重新 force-stop 并启动 App）...")
+                time.sleep(3)
+
+    if key and secret:
+        print(f"\n[+] 提取成功！nativeAppKey    = {key}")
+        print(f"           nativeAppSecret = {secret}")
+        maybe_write_env(key, secret)
+    else:
+        print("\n[!] 多次尝试均未提取到 b/c 字段值。排查建议：")
+        print("    1. 反复在 suspend/断点阶段断开 → 多为模拟器非冷启动或平台连接"
+              "不稳，请冷启动模拟器（文档 4.5 坑 1/坑 2）后重跑")
+        print("    2. 反复未命中断点/字段为空 → App 可能更新了混淆类名，"
+              "需按文档第 1 节思路重新静态分析")
+        print("    3. 逐段排查可参考文档 4.3 节的 jdb 命令序列；速查表见 7.4 节")
+        sys.exit(1)

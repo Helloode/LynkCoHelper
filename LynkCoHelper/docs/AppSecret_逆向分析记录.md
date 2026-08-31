@@ -459,22 +459,24 @@ python3 LynkCoHelper/tools/extract_appsecret.py <AVD名字>  # 指定要冷启�
 
 ## 7. 一键提取（推荐）
 
-> 本节写给"密钥失效了，我只想重新提出密钥"的读者。脚本
-> `LynkCoHelper/tools/extract_appsecret.py` 会自动完成全部技术环节（依赖
-> 下载、冷启动模拟器、代理抢握手、断点提取、写入 env.json、失败重试），
-> **只有两件事必须手动做（各一次）**：创建模拟器、安装领克 App——它们各需
-> 约 1.5GB 下载且要图形界面/许可确认，自动化性价比极低。原理与踩坑细节见
-> 第 4 / 4.5 节；脚本失败先查 7.4 常见问题表。
+> 本节写给"密钥失效了，我只想重新提出密钥"的读者。提取脚本按平台分两个入口
+> （共享核心 `tools/appsecret_core.py`：代理/jdb 交互/提取主循环）：
+>
+> | 入口 | 平台 | 特点 |
+> |---|---|---|
+> | `tools/extract_appsecret.py` | macOS | 常规本地使用，**仅一件事手动做（一次）**：创建模拟器；领克 App 自动下载安装 |
+> | `tools/extract_appsecret_linux.py` | Linux / CI | 一切全自动（含模拟器、APK），适合无人值守；GitHub Actions 手动触发见 `.github/workflows/extract-appsecret.yml` |
+>
+> 两者均自动完成：依赖下载、冷启动模拟器、代理抢握手、断点提取、写入
+> env.json、失败重试。原理与踩坑细节见第 4 / 4.5 节；脚本失败先查 7.4 常见问题表。
 
-### 7.1 一次性手动准备（仅 2 步）
+### 7.1 一次性手动准备（仅 1 步，仅 macOS 入口需要）
 
 1. **创建模拟器（AVD）**：安装 Android Studio（自带 SDK 管理器与模拟器）
-   → Device Manager → Create Virtual Device → 任选一款手机 → 系统镜像
-   **必须选 "Google APIs" 版本，不要选带 "Google Play" 的版本**（Play 版是
-   零售固件 `user`，不允许 JDWP 调试，是新手最常踩的坑）。API 31~34 的
-   Google APIs 镜像均可（userdebug 固件），实测 API 33。
-2. **安装领克 App**：从官网/应用商店/第三方 APK 站下载官方正式包
-   （`com.lynkco.customer`），把 `.apk` 文件**直接拖进模拟器窗口**即可安装。
+→ Device Manager → Create Virtual Device → 任选一款手机 → 系统镜像
+**必须选 "Google APIs" 版本，不要选带 "Google Play" 的版本**（Play 版是
+零售固件 `user`，不允许 JDWP 调试，是新手最常踩的坑）。API 31~34 的
+Google APIs 镜像均可（userdebug 固件），实测 API 33。
 
 以下均**无需手动准备**，脚本自动处理：
 
@@ -484,17 +486,27 @@ python3 LynkCoHelper/tools/extract_appsecret.py <AVD名字>  # 指定要冷启�
 | `adb`（platform-tools ~10MB） | 缺失时询问并自动下载官方公开源到 `~/.lynkco-helper-tools/`（二次运行复用） |
 | `jdb`（JDK 8 ~110MB） | 同上（Amazon Corretto 8，自动匹配 macOS arm64/x64、Linux x64） |
 | 模拟器启动 | 无在线设备时自动 `-no-snapshot-load` **冷启动**（规避 4.5 节坑 1） |
+| 领克 App APK（约 285MB） | 设备未装时自动从领克官方 CDN 下载最新版并 `adb install`（已下载则复用） |
 | 提取结果 | 成功后询问 `[y/N]`，确认则自动写入 `env.json`（已被 gitignore） |
 
 ### 7.2 运行
 
 ```bash
-# 仓库根目录执行；无在线设备时自动列出并冷启动 AVD（多个则交互选择）
+# macOS（仓库根目录执行；无在线设备时自动列出并冷启动 AVD，多个则交互选择）
 python3 LynkCoHelper/tools/extract_appsecret.py
-
-# 或指定 AVD
 python3 LynkCoHelper/tools/extract_appsecret.py <AVD名字>
+
+# Linux / CI（全自动：KVM 预检 -> 自动下载 emulator+镜像+APK -> 无头冷启动）
+python3 LynkCoHelper/tools/extract_appsecret_linux.py
 ```
+
+环境变量（两个入口均生效）：`EMU_HEADLESS=1` 强制无头启动模拟器（Linux 上
+无 DISPLAY 的服务器/CI 会自动切无头，无需手动设）；`LYNKCO_AUTO_WRITE=1`
+免交互确认，直接写入 env.json。
+
+CI 工作流另支持可选 Secret `LYNKCO_PAT`（具备本仓库 Secret 写权限的 PAT）：
+配置后提取结果会自动合并更新 `LYNKCO_APP_SECRETS` Secret，未配置时从
+运行日志取值手动更新。
 
 预计耗时：首次（含下载依赖）约 5~10 分钟，之后每次约 1~2 分钟。脚本自动
 完成 4.5 节的全流程：代理抢握手 → suspend 冻结 → 断点 → 单步探测 →
