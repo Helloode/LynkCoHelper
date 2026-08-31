@@ -465,16 +465,22 @@ python3 LynkCoHelper/tools/extract_appsecret.py <AVD名字>  # 指定要冷启�
 > | 入口 | 平台 | 特点 |
 > |---|---|---|
 > | `tools/extract_appsecret.py` | macOS（本地） | 常规本地使用，**仅一件事手动做（一次）**：创建模拟器；领克 App 自动下载安装 |
-> | `tools/extract_appsecret_auto.py` | CI / 无本地环境（仅 macOS arm64） | 一切全自动（含模拟器镜像、APK），适合无人值守；GitHub Actions 手动触发见 `.github/workflows/extract-appsecret.yml` |
+> | `tools/extract_appsecret_auto.py` | macOS Apple Silicon / Linux x86_64（含 CI） | 一切全自动（含模拟器镜像、APK），适合无人值守；GitHub Actions 手动触发见 `.github/workflows/extract-appsecret.yml`（ubuntu-latest） |
 >
-> 架构硬约束：领克 APK 仅含 arm64-v8a 原生库，x86_64 模拟器靠 libndk 翻译
-> 执行 ARM 代码时其加固壳必崩（SIGSEGV，2026-08-31 ubuntu runner 实测），
-> 故 CI 必须用 arm64 runner（macos-latest），自动版已收敛为仅支持 macOS
-> Apple Silicon（Linux x86_64 路线已移除——必败路线不值得维护）；Intel
-> mac 同理只能用 arm64 真机。另注：GitHub macOS arm runner 是 VM，
-> guest 内无 Hypervisor.framework（actions/runner-images#13505），脚本
-> 自动降级 qemu TCG 软件模拟（-accel off），冷启动实测可用（M4 Pro 53s，
-> runner 更慢但 boot 超时已放宽到 20 分钟）。
+> 架构硬约束：领克 APK 仅含 arm64-v8a 原生库，**镜像 ABI 恒为 arm64-v8a**。
+> 可行路线只有两条（2026-08-31 实测定案）：
+> 1. **macOS Apple Silicon（本地）**：Hypervisor.framework 原生虚拟化，快。
+> 2. **Linux x86_64（CI/ubuntu runner）**：x64 emulator 包自带
+>    qemu-system-aarch64，对 arm64 镜像做全系统 TCG 模拟——整个 guest
+>    就是 arm64 Android，App 的加固壳跑真 ARM64 指令（逐条翻译），
+>    无 libndk 翻译层、不会崩溃；代价是慢（冷启动 20~50 分钟），
+>    boot 超时已放宽到 50 分钟，工作流 timeout 180 分钟。
+> 已排除的路线（勿再踩）：ubuntu+x86_64 镜像（libndk 下加固壳必崩）；
+> macos runner——VM 内无 Hypervisor.framework（actions/runner-images#13505），
+> 且 Android emulator 的 arm64 guest 在 macOS 上死绑 HVF（37.1.11 实测：
+> -accel off 传给 qemu 后仍走 HVF，-qemu 直通 -accel tcg 即 fatal
+> "HVF error: HV_NO_DEVICE"），无法降级 TCG；预装 darwin-x86_64 包
+> 也不含 qemu-system-aarch64。Intel mac / Linux ARM64 同理不可行。
 >
 > 两者均自动完成：依赖下载、冷启动模拟器、代理抢握手、断点提取、写入
 > env.json、失败重试。原理与踩坑细节见第 4 / 4.5 节；脚本失败先查 7.4 常见问题表。
@@ -493,7 +499,7 @@ Google APIs 镜像均可（userdebug 固件），实测 API 33。
 |---|---|
 | `pexpect` | 缺失时自动 `pip install` |
 | `adb`（platform-tools ~10MB） | 缺失时询问并自动下载官方公开源到 `~/.lynkco-helper-tools/`（二次运行复用） |
-| `jdb`（JDK 8 ~110MB） | 同上（Amazon Corretto 8 aarch64 macOS；本机已装任意 JDK 时直接复用其 jdb） |
+| `jdb`（JDK 8 ~110MB） | 同上（macOS: Corretto 8 aarch64 / Linux: Corretto 8 x64；本机已装任意 JDK 时直接复用其 jdb） |
 | 模拟器启动 | 无在线设备时自动 `-no-snapshot-load` **冷启动**（规避 4.5 节坑 1） |
 | 领克 App APK（约 285MB） | 设备未装时自动从领克官方 CDN 下载最新版并 `adb install`（已下载则复用） |
 | 提取结果 | 成功后询问 `[y/N]`，确认则自动写入 `env.json`（已被 gitignore） |
@@ -510,9 +516,9 @@ python3 LynkCoHelper/tools/extract_appsecret_auto.py
 ```
 
 环境变量（两个入口均生效）：`EMU_HEADLESS=1` 强制无头启动模拟器（CI 必设；
-本地默认窗口模式）；`EMU_ACCEL=off` 强制 qemu TCG 软件模拟（无 HVF 的
-环境自动降级时脚本也会自己设）；`LYNKCO_AUTO_WRITE=1` 免交互确认，
-直接写入 env.json。
+本地默认窗口模式，无 DISPLAY 的 Linux 自动无头）；`LYNKCO_AUTO_WRITE=1`
+免交互确认，直接写入 env.json。Linux（TCG 全系统模拟）下所有等待窗口
+自动放宽 10 倍，无需手工干预。
 
 CI 工作流另支持可选 Secret `LYNKCO_PAT`（具备本仓库 Secret 写权限的 PAT）：
 配置后提取结果会自动合并更新 `LYNKCO_APP_SECRETS` Secret，未配置时从

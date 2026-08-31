@@ -70,6 +70,16 @@ TOOLS_DIR = os.path.expanduser("~/.lynkco-helper-tools")
 
 MAX_ATTEMPTS = 3
 
+# 全系统 TCG 环境（Linux x86_64 宿主跑 arm64-v8a 镜像，见
+# extract_appsecret_auto.py）：qemu 逐条翻译 ARM 指令，VM 每步执行慢一两个
+# 数量级，所有与设备/VM 交互的等待窗口按平台放大
+SLOW_VM = sys.platform == "linux"
+
+
+def _vt(base):
+    """按平台放大超时：TCG 全系统模拟 10 倍，macOS HVF 原生 1 倍。"""
+    return base * 10 if SLOW_VM else base
+
 # 领克官方最新版本号查询接口（App 自动下载安装用，见 ensure_apk）
 LYNKCO_VER_API = "https://app-api-gw-toc.lynkco.com/app/newest/info"
 
@@ -347,22 +357,21 @@ def ensure_apk():
 def cold_start_and_wait(emu, avd):
     """冷启动 AVD 并等 boot_completed。设 EMU_HEADLESS=1 或无 DISPLAY 的
     Linux 自动切无头模式（CI/服务器场景）；macOS 保持窗口模式。
-    设 EMU_ACCEL=off 则附加 -accel off（qemu TCG 纯软件模拟）：用于无
-    Hypervisor.framework 的环境（如 GitHub macOS arm64 runner），
-    此时启动/运行更慢，boot 超时同步放宽。"""
+    Linux x86_64 宿主跑 arm64 镜像走 qemu 全系统 TCG 模拟，冷启动慢
+    （20~50 分钟），boot 超时已按平台放宽，心跳每 30 秒一行。"""
     headless = os.environ.get("EMU_HEADLESS") or \
         (sys.platform != "darwin" and not os.environ.get("DISPLAY"))
-    accel = os.environ.get("EMU_ACCEL", "").strip().lower()
     cmd = [emu, "-avd", avd, "-no-snapshot-load"]
-    if accel:
-        cmd += ["-accel", accel]
-    accel_note = "，TCG 软件模拟（无 HVF），更慢属预期" if accel == "off" else ""
     if headless:
         cmd += ["-no-window", "-gpu", "swiftshader_indirect",
                 "-no-audio", "-no-boot-anim"]
-        print(f"[*] 冷启动模拟器 {avd}（无头模式{accel_note}，约需 2~5 分钟）...")
+        if SLOW_VM:
+            print(f"[*] 冷启动模拟器 {avd}（无头，全系统 TCG 模拟 arm64 镜像，"
+                  "冷启动 20~50 分钟属预期）...")
+        else:
+            print(f"[*] 冷启动模拟器 {avd}（无头模式，约需 2~5 分钟）...")
     else:
-        print(f"[*] 冷启动模拟器 {avd}（-no-snapshot-load{accel_note}，约需 1~2 分钟）...")
+        print(f"[*] 冷启动模拟器 {avd}（-no-snapshot-load，约需 1~2 分钟）...")
     env = os.environ.copy()
     sdk_root = os.path.dirname(os.path.dirname(emu))
     # 必须覆盖而非 setdefault：CI runner（如 GitHub ubuntu-latest）预设了
@@ -402,19 +411,20 @@ def cold_start_and_wait(emu, avd):
                 pass
         sys.exit(f"[!] {reason}")
 
-    print("[*] 等待 adb 连接模拟器（最多 5 分钟）...")
+    print("[*] 等待 adb 连接模拟器...")
     try:
-        subprocess.run([ADB, "wait-for-device"], capture_output=True, timeout=300)
+        subprocess.run([ADB, "wait-for-device"], capture_output=True,
+                       timeout=600 if SLOW_VM else 300)
     except subprocess.TimeoutExpired:
-        _fail("adb 连接模拟器超时（5 分钟）")
-    # TCG 软模拟（-accel off）冷启动慢得多（GitHub macos arm runner 无 HVF
-    # 的实际路径），超时 8 -> 20 分钟；本机 M4 Pro 实测 TCG 53s，M1 VM 留足余量
-    boot_polls = 600 if accel == "off" else 240
+        _fail("adb 连接模拟器超时（%d 分钟）" % (10 if SLOW_VM else 5))
+    # TCG 全系统模拟（Linux x86_64 宿主跑 arm64 镜像）冷启动慢得多，
+    # boot 超时 8 -> 50 分钟；macOS HVF 原生路径维持 8 分钟
+    boot_polls = 1500 if SLOW_VM else 240
     for i in range(boot_polls):
         if adb("shell", "getprop", "sys.boot_completed").strip() == "1":
             print("[+] 模拟器启动完成")
             # 等 adbd / am 就绪，避免首轮 am start 拿不到 PID（TCG 下更保守）
-            time.sleep(10 if accel == "off" else 5)
+            time.sleep(30 if SLOW_VM else 5)
             return
         time.sleep(2)
         if i and i % 15 == 0:   # 每 30 秒一行心跳，CI 日志不静默
@@ -455,14 +465,16 @@ class Proxy:
         self.status = "jdb_connected"
         srv.close()
 
-        # 2. 等主流程通知上游就绪
-        self.upstream_ready.wait(timeout=30)
+        # 2. 等主流程通知上游就绪（无限等：TCG 全系统模拟下 am start ->
+        #    pidof 链路可能要几分钟；主流程退出时 close() 会 set 本事件
+        #    并置 aborted，不会挂死）
+        self.upstream_ready.wait()
         if self.aborted:
             return
         # 3. 抢先连接上游（命中早期窗口）并完成握手
         try:
             up = socket.socket()
-            up.settimeout(10)
+            up.settimeout(_vt(10))
             up.connect(("127.0.0.1", UPSTREAM_PORT))
             up.sendall(b"JDWP-Handshake")
             echo = b""
@@ -662,16 +674,16 @@ def run_once():
 
         # 启动 App（等待调试器状态），进程一出现立刻建立 forward 并放行代理
         adb("shell", "am", "force-stop", APP)
-        time.sleep(0.5)
+        time.sleep(_vt(0.5))
         started = adb("shell", "am", "start", "-D", "-n", ACTIVITY)
         for ln in started.splitlines():
             if ln.strip():
                 print(f"    am start: {ln.strip()}")
         t0 = time.time()
         pid = None
-        # 按 deadline 而非次数等：TCG 软模拟（CI 无 HVF）下 am start 拉起
-        # 进程明显更慢，且每次 adb 往返耗时不可控；出现即返回，等久不亏
-        pid_deadline = time.time() + 45
+        # 按 deadline 而非次数等：TCG 全系统模拟下 am start 拉起进程慢
+        # （分钟级），且每次 adb 往返耗时不可控；出现即返回，等久不亏
+        pid_deadline = time.time() + _vt(45)
         while time.time() < pid_deadline:
             out = adb("shell", f"pidof {APP}")
             out = out.strip()
@@ -687,11 +699,11 @@ def run_once():
         adb("forward", f"tcp:{UPSTREAM_PORT}", f"jdwp:{pid}")
         proxy.upstream_ready.set()
 
-        # 新装 285MB App 首启需 dex 校验，模拟器负载高时（TCG 软模拟尤甚）
-        # VM 达到等待调试器状态可能较慢，给足 60 秒；但若上游连接失败
-        # （进程秒退，如加固壳在 ARM 翻译层下必崩的 SIGSEGV，2026-08-31
-        # CI 实测），立即失败进入重试，不浪费整个超时窗口
-        deadline = time.time() + 60
+        # 新装 285MB App 首启需 dex 校验，模拟器负载高时（TCG 全系统模拟
+        # 尤甚）VM 达到等待调试器状态可能较慢，窗口按平台放大；但若上游
+        # 连接失败（进程秒退，如加固壳异常退出），立即失败进入重试，
+        # 不浪费整个超时窗口
+        deadline = time.time() + _vt(60)
         while not proxy.handshake_done.is_set():
             if proxy.upstream_failed.is_set():
                 _dump_device_diagnostics("上游连接失败（App 进程大概率已退出）")
@@ -708,16 +720,17 @@ def run_once():
 
         # 等 jdb 初始化完成出现提示符（两种形态："> " / "main[1] "）
         try:
-            child.expect(PROMPTS + [pexpect.EOF, pexpect.TIMEOUT], timeout=30)
+            child.expect(PROMPTS + [pexpect.EOF, pexpect.TIMEOUT],
+                         timeout=_vt(30))
         except Exception:
             pass
 
         # 尽快冻结 VM，最大限度赢得与 clinit 的竞速
         print("\n[*] suspend")
-        send_cmd(child, "suspend", timeout=10)
+        send_cmd(child, "suspend", timeout=_vt(10))
 
         print("\n[*] Setting breakpoint ...")
-        send_cmd(child, f"stop in {CLASS}.<clinit>")
+        send_cmd(child, f"stop in {CLASS}.<clinit>", timeout=_vt(15))
 
         print("\n[*] resume")
         try:
@@ -727,7 +740,7 @@ def run_once():
         # resume 后断点事件（"设置延迟的断点/断点命中"）会异步到达，这里
         # 不能用 send_cmd（其静默等待可能提前吞掉断点事件），直接等断点文本。
         idx = child.expect(BREAKPOINT_PATTERNS + [pexpect.EOF, pexpect.TIMEOUT],
-                           timeout=90)
+                           timeout=_vt(90))
         if idx == len(BREAKPOINT_PATTERNS):
             raise Disconnected("等待断点期间 jdb 已退出（EOF）")
         if idx < len(BREAKPOINT_PATTERNS):
@@ -739,8 +752,8 @@ def run_once():
                 pass
             for i in range(15):
                 print(f"\n[*] next (step {i + 1})")
-                send_cmd(child, "next", timeout=15)
-                out = send_cmd(child, f"print {CLASS}.c", timeout=10)
+                send_cmd(child, "next", timeout=_vt(15))
+                out = send_cmd(child, f"print {CLASS}.c", timeout=_vt(10))
                 val = parse_field(out)
                 print(f"    -> c probe: {val!r}")
                 if val:
@@ -751,7 +764,8 @@ def run_once():
         print("\n[*] Dumping fields b/c/d/e ...")
         results = {}
         for field in ["b", "c", "d", "e"]:
-            results[field] = send_cmd(child, f"print {CLASS}.{field}", timeout=10)
+            results[field] = send_cmd(child, f"print {CLASS}.{field}",
+                                      timeout=_vt(10))
 
         print("\n" + "=" * 60)
         print("[RESULT]")

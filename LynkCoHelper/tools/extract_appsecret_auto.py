@@ -3,13 +3,19 @@
 extract_appsecret_auto.py —— 全自动版（CI / 无本地 Android 环境的机器）：
 从零自动提取领克 App 的 nativeAppKey / nativeAppSecret。
 
-支持平台：仅 macOS Apple Silicon（arm64）——这是唯一可行的自动化路线。
-领克 APK 仅含 arm64-v8a 原生库，x86_64 模拟器靠 libndk 翻译执行 ARM
-代码时其加固壳必崩（SIGSEGV，2026-08-31 ubuntu runner 三次实测），
-Linux x86_64 路线已废弃（对领克 App 必败，维护无意义）。GitHub Actions
-macos-latest runner 实测路径：复用 runner 预装的 adb/JDK，但其预装
-emulator 是 x86_64 包（无法承载 arm64 guest），需自下载
-emulator-darwin_aarch64 + arm64-v8a API34 系统镜像（约 1.2GB）与 APK。
+支持平台（镜像 ABI 恒为 arm64-v8a——领克 APK 仅含 arm64 原生库）：
+  - macOS Apple Silicon：Hypervisor.framework 原生虚拟化，快；本地
+    全自动首选。
+  - Linux x86_64（含 GitHub Actions ubuntu runner）：qemu 全系统 TCG
+    模拟——x64 emulator 包自带 qemu-system-aarch64，逐条翻译 ARM
+    指令，整个 guest 就是 arm64 Android，App 的加固壳跑真 ARM64 代码，
+    无 libndk 翻译层、不会崩溃；代价是慢（冷启动 20~50 分钟）。
+
+已排除的路线（2026-08-31 实测，勿再踩）：
+  - ubuntu + x86_64 镜像：App 的 arm64 库经 libndk 翻译执行，加固壳必崩
+  - macOS runner（VM 内）：无 Hypervisor.framework，而 Android emulator
+    的 arm64 guest 在 macOS 上死绑 HVF（-accel off 无效、-qemu 直通
+    -accel tcg 即 fatal），且预装 darwin-x86_64 包不含 qemu-system-aarch64
 
 用法（在仓库根目录执行，详见文档第 7 节）：
   python3 LynkCoHelper/tools/extract_appsecret_auto.py            # 全自动
@@ -19,16 +25,15 @@ emulator-darwin_aarch64 + arm64-v8a API34 系统镜像（约 1.2GB）与 APK。
   1. 前置环境自动探测与下载（存 ~/.lynkco-helper-tools/，二次运行复用）：
      - pexpect 缺失 -> 自动 pip 安装
      - adb / jdb 缺失 -> 多镜像源自动下载官方公开源包
-     - emulator：本地已有的（含 arm64 qemu 后端）直接用；否则自下载
-       darwin_aarch64 原生包（GitHub macos runner 预装的是 x86_64 包，
-       启动 arm64 AVD 即失败，不能用）
+     - emulator：本地已有的（带 qemu-system-aarch64）直接用；否则自下载
+       （macos runner 预装的 darwin-x86_64 包不含 arm64 qemu，不能用）
      - arm64-v8a API34 Google APIs 系统镜像缺失 -> 下载（约 1.2GB）、
        手工创建 AVD（无需 cmdline-tools）
-     - 硬件加速检测（下载前做，避免白下镜像才发现起不来）：有 HVF 用
-       HVF；无 HVF（如 GitHub macos arm runner 是 VM）自动降级 qemu TCG
-       软件模拟（-accel off），boot 超时同步放宽
+     - 硬件加速预检：macOS 查 Hypervisor.framework（缺失直接失败并指路
+       Linux 路线——mac 上 arm64 guest 无法降级 TCG）；Linux 无需 KVM
+       （arm64 镜像走 qemu TCG 全系统模拟）
   2. 无在线设备时自动冷启动 AVD（-no-snapshot-load，规避快照导致的握手
-     挂死；设 EMU_HEADLESS=1 切无头模式，适配 CI）
+     挂死；设 EMU_HEADLESS=1 或无 DISPLAY 时自动切无头模式，适配 CI）
   3. 设备未装领克 App 时 -> 从领克官方 CDN 下载最新版 APK（约 285MB）
      自动安装（与 macOS 版共用 core.ensure_apk）
   4. 代理抢握手 -> jdb 断点单步 -> 提取 b/c 字段
@@ -41,6 +46,7 @@ emulator-darwin_aarch64 + arm64-v8a API34 系统镜像（约 1.2GB）与 APK。
 本地 macOS 已有 Android Studio 环境时，交互友好的入口是
 tools/extract_appsecret.py。
 """
+import glob
 import os
 import platform
 import re
@@ -58,26 +64,36 @@ _PKG_MIRRORS = [
 
 _AVD_NAME = "lynkco_helper_avd"
 
-# 平台参数（仅 macOS Apple Silicon 一条路，原因见文件头）
+_IS_MAC = sys.platform == "darwin"
+
+# 平台参数：镜像 ABI 恒为 arm64-v8a（App 硬约束）；emulator 包、
+# platform-tools 与 Corretto 包按宿主平台选
 _ABI = "arm64-v8a"
-_EMU_PKG_RE = r"(emulator-darwin_aarch64-\d+\.zip)"
 _SYSIMG_PKG_RE = r"(arm64-v8a-34_r\d+\.zip)"
 _SYSIMG_FALLBACK = "sys-img/google_apis/arm64-v8a-34_r14.zip"
-_PT_ZIP = "platform-tools-latest-darwin.zip"
-_CORRETTO_PKG = "amazon-corretto-8-aarch64-macos-jdk.tar.gz"
 _SYSIMG_MB = 1200
+if _IS_MAC:
+    _EMU_PKG_RE = r"(emulator-darwin_aarch64-\d+\.zip)"
+    _PT_ZIP = "platform-tools-latest-darwin.zip"
+    _CORRETTO_PKG = "amazon-corretto-8-aarch64-macos-jdk.tar.gz"
+else:
+    # x64 emulator 包自带 qemu-system-aarch64（arm64 guest 走全系统 TCG）
+    _EMU_PKG_RE = r"(emulator-linux_x64-\d+\.zip)"
+    _PT_ZIP = "platform-tools-latest-linux.zip"
+    _CORRETTO_PKG = "amazon-corretto-8-x64-linux-jdk.tar.gz"
 
 
 def ensure_adb():
     """探测 adb；缺失时自动下载 Android platform-tools（官方公开源，
-    ~10MB，解压即用，无需许可协议）。CI 的 macOS runner 已预装，直接复用。"""
+    ~10MB，解压即用，无需许可协议）。CI runner 已预装，直接复用。"""
     p = core.find_adb()
     if p:
         return p
     dest = os.path.join(core.TOOLS_DIR, "platform-tools")
     if not core._confirm_download("adb (Android platform-tools)", 10, dest):
-        sys.exit("[!] 未找到 adb 且跳过下载。请安装 Android Studio"
-                 "（文档 7.1 节）或 brew install android-platform-tools 后重试。")
+        sys.exit("[!] 未找到 adb 且跳过下载。请安装 Android Studio（文档 7.1 节）"
+                 "或系统包管理器（macOS: brew install android-platform-tools；"
+                 "Linux: sudo apt install adb）后重试。")
     os.makedirs(core.TOOLS_DIR, exist_ok=True)
     arc = os.path.join(core.TOOLS_DIR, _PT_ZIP)
     core._download("https://dl.google.com/android/repository/" + _PT_ZIP, arc, 10)
@@ -100,8 +116,7 @@ def ensure_jdb():
     dest = os.path.join(core.TOOLS_DIR, "jdk8")
     if not core._confirm_download("jdb (Amazon Corretto 8 / JDK 8)", 110, dest):
         sys.exit("[!] 未找到 jdb 且跳过下载。请安装任意版本 JDK 后重试"
-                 "（如 brew install --cask corretto8；jdb 走 JDWP 协议，"
-                 "任意版本均可）。")
+                 "（jdb 走 JDWP 协议，任意版本均可）。")
     os.makedirs(core.TOOLS_DIR, exist_ok=True)
     arc = os.path.join(core.TOOLS_DIR, _CORRETTO_PKG)
     core._download("https://corretto.aws/downloads/latest/" + _CORRETTO_PKG,
@@ -201,53 +216,51 @@ def _create_avd_manual(avd_name):
 
 
 def _ensure_acceleration():
-    """硬件加速检测：有 Hypervisor.framework 用 HVF（默认，不改环境）；
-    没有则降级 qemu TCG 纯软件模拟（设 EMU_ACCEL=off，由 core 的
-    cold_start_and_wait 转成 -accel off，boot 超时同步放宽）。
-
-    GitHub macOS arm64 runner 是 VM，guest 内无 HVF（官方确认短期无解，
-    actions/runner-images#13505），故 CI 上实际就是走 TCG——本机
-    emulator 36.6.11（与 runner 预装同版）实测 arm64 镜像 -accel off
-    冷启动 53s，完全可用，仅全程更慢。"""
+    """硬件加速预检（下载镜像前做，避免白下 ~1.2GB 后才发现起不来）：
+    - macOS：arm64 guest 死绑 Hypervisor.framework（37.1.11 实测：
+      -accel off 传给 qemu 后仍走 HVF；-qemu 直通 -accel tcg 即
+      fatal "HVF error: HV_NO_DEVICE"），无 HVF 直接失败并指路 Linux
+      路线。GitHub macos runner 是 VM，guest 内无 HVF（官方确认短期
+      无解，actions/runner-images#13505）——mac runner 不可行。
+    - Linux x86_64：arm64 镜像走 qemu 全系统 TCG 模拟，无需 KVM。"""
+    if not _IS_MAC:
+        return
     try:
         out = core.sh(["sysctl", "-n", "kern.hv_support"]).strip()
     except Exception:
         out = ""
-    hvf = out == "1"
-    if os.environ.get("EMU_ACCEL", "").lower() == "off":
-        return   # 已降级或用户已强制（ensure_device/ensure_emulator 各调一次，幂等）
-    if hvf:
-        return   # HVF 可用（物理 Mac 默认路径）
-    print("[*] 无 Hypervisor.framework（VM 内？），降级 qemu TCG 软件模拟"
-          "（启动与运行更慢，属预期）")
-    os.environ["EMU_ACCEL"] = "off"
+    if out != "1":
+        sys.exit("[!] 此 macOS 无 Hypervisor.framework（VM 内？）。Android "
+                 "emulator 的 arm64 guest 在 macOS 上死绑 HVF，无法降级 "
+                 "TCG（2026-08-31 实测），本环境跑不了 arm64 镜像。\n"
+                 "    CI 请用 ubuntu-latest：x86_64 宿主 + arm64-v8a 镜像，"
+                 "qemu 全系统 TCG 模拟，App 的 arm64 代码原生执行。")
 
 
 def _emu_supports_arm64_guests(emu):
-    """检查 emulator 能否承载 arm64 guest：qemu 后端目录需存在
-    qemu/darwin-aarch64/qemu-system-aarch64。
-    GitHub macos runner 预装的是 x86_64 包（launcher 在 Rosetta 下运行），
-    启动 arm64 AVD 即报 "Could not launch .../qemu/darwin-x86_64/
-    qemu-system-aarch64: No such file or directory"（run 33359423830
-    实测），必须改用自下载的 darwin_aarch64 原生包。"""
-    qemu = os.path.join(os.path.dirname(emu), "qemu", "darwin-aarch64",
-                        "qemu-system-aarch64")
-    return os.path.exists(qemu)
+    """检查 emulator 是否带 qemu-system-aarch64（承载 arm64 guest 的前提）。
+    darwin-aarch64 / linux-x86_64 官方包都带；GitHub macos runner 预装的
+    darwin-x86_64 包不带（启动 arm64 AVD 即 "Could not launch .../qemu/
+    darwin-x86_64/qemu-system-aarch64"，run 33359423830 实测）。"""
+    hits = glob.glob(os.path.join(os.path.dirname(emu), "qemu", "*",
+                                  "qemu-system-aarch64*"))
+    return bool(hits)
 
 
 def ensure_emulator(existing_emu=None):
     """自动下载 emulator + 系统镜像并创建 AVD（镜像约 1.2GB）。
     返回 (emulator_path, avd_name)。下载前先做硬件加速预检。
-    现有 emulator 缺 arm64 qemu 后端时（如 GitHub macos runner 预装的
-    x86_64 包）不用它，改用自下载的 darwin_aarch64 原生包。"""
+    现有 emulator 不带 qemu-system-aarch64 时（如 macos runner 预装的
+    darwin-x86_64 包）不用它，改自下载对应平台的官方包（linux_x64 包
+    自带 qemu-system-aarch64）。"""
     sdk_root = os.path.join(core.TOOLS_DIR, "sdk")
     emu = os.path.join(sdk_root, "emulator", "emulator")
     if existing_emu and _emu_supports_arm64_guests(existing_emu):
         emu = existing_emu
         sdk_root = os.path.dirname(os.path.dirname(emu))
     elif existing_emu:
-        print("[*] 现有 emulator 缺 arm64 qemu 后端（GitHub macos runner 预装的"
-              "是 x86_64 包），改用自下载的 darwin_aarch64 原生 emulator ...")
+        print("[*] 现有 emulator 不带 qemu-system-aarch64（无法承载 arm64 "
+              "guest），改用自下载的官方 emulator 包 ...")
     else:
         print("[*] 未找到 emulator，开始自动安装 ...")
     os.makedirs(sdk_root, exist_ok=True)
@@ -326,14 +339,13 @@ def ensure_device(wanted_avd=None):
         emu, avd = ensure_emulator()
         core.cold_start_and_wait(emu, avd)
         return
-    _ensure_acceleration()   # 有 emulator 也先检测加速：无 HVF 则降级 TCG，别白等超时
+    _ensure_acceleration()   # 有 emulator 也先预检：mac 无 HVF 直接失败，别白下镜像白等超时
     avds = core.sh([emu, "-list-avds"]).split()
     if not avds:
         # 复用/自备 emulator，补齐镜像并创建 AVD。
-        # 必须用返回值：预装 emulator 缺 arm64 后端时 ensure_emulator 会
-        # 切换为自下载的 darwin_aarch64 包（run 33361068931 踩坑：丢弃
-        # 返回值导致仍用 x86_64 emulator + 镜像在另一 sdk 根，启动即
-        # PANIC "Broken AVD system path"）
+        # 必须用返回值：现有 emulator 不带 arm64 qemu 时 ensure_emulator 会
+        # 切换为自下载的官方包（run 33361068931 踩坑：丢弃返回值导致仍用
+        # 预装 emulator + 镜像在另一 sdk 根，启动即 PANIC "Broken AVD system path"）
         emu, avd = ensure_emulator(emu)
         core.cold_start_and_wait(emu, avd)
         return
@@ -356,11 +368,15 @@ def ensure_device(wanted_avd=None):
 
 
 def main():
-    if sys.platform != "darwin" or platform.machine() != "arm64":
-        sys.exit("[!] 本自动版仅支持 macOS Apple Silicon（arm64）：领克 App 原生库"
-                 "仅 arm64-v8a，x86_64 模拟器的 ARM 翻译层（libndk）下其加固壳必崩"
-                 "（2026-08-31 ubuntu runner 实测），Linux/Intel mac 路线均已废弃。"
-                 "其他平台请改用 arm64 真机（adb 连接后跑本地版 "
+    if _IS_MAC and platform.machine() != "arm64":
+        sys.exit("[!] Intel mac 不支持：emulator 的 darwin-x86_64 包不含 "
+                 "qemu-system-aarch64，跑不了 arm64 镜像。请改用 x86_64 Linux"
+                 "（qemu 全系统 TCG 模拟）或 arm64 真机（adb 连接后跑本地版 "
+                 "tools/extract_appsecret.py）。")
+    if not _IS_MAC and platform.machine() != "x86_64":
+        sys.exit("[!] Linux ARM64 无官方 emulator/platform-tools 包。请改用 "
+                 "x86_64 Linux（ubuntu runner，qemu 全系统 TCG 模拟）、"
+                 "Apple Silicon Mac（HVF 原生）或 arm64 真机（本地版 "
                  "tools/extract_appsecret.py）。")
     core.ensure_pexpect()
     core.setup(ensure_adb(), ensure_jdb())
