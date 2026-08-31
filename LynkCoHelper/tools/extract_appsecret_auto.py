@@ -210,14 +210,12 @@ def _ensure_acceleration():
     except Exception:
         out = ""
     hvf = out == "1"
-    forced = os.environ.get("EMU_ACCEL", "").lower() == "off"
-    if hvf and not forced:
+    if os.environ.get("EMU_ACCEL", "").lower() == "off":
+        return   # 已降级或用户已强制（ensure_device/ensure_emulator 各调一次，幂等）
+    if hvf:
         return   # HVF 可用（物理 Mac 默认路径）
-    if forced:
-        print("[*] EMU_ACCEL=off，强制 qemu TCG 软件模拟（启动与运行更慢，属预期）")
-    else:
-        print("[*] 无 Hypervisor.framework（VM 内？），降级 qemu TCG 软件模拟"
-              "（启动与运行更慢，属预期）")
+    print("[*] 无 Hypervisor.framework（VM 内？），降级 qemu TCG 软件模拟"
+          "（启动与运行更慢，属预期）")
     os.environ["EMU_ACCEL"] = "off"
 
 

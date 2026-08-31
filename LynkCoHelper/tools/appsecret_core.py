@@ -206,8 +206,12 @@ def _download_to(url, dest_file, interval=10):
 
     进度行包含 百分比/MB/瞬时速度/预计剩余，每 interval 秒最多一行：
     CI 日志按行刷新（\r 单行刷新在 Actions 里不可见，大文件会全程静默），
-    本地终端也不会被刷屏。连接与读均有 60 秒超时，避免 stall 挂死。"""
+    本地终端也不会被刷屏。连接与读均有 60 秒超时，避免 stall 挂死。
+    下载前先建父目录：runner 上 adb/jdb/emulator 常全预装，所有 ensure_*
+    提前返回时 TOOLS_DIR 可能从未被创建过（mac runner 实测踩坑：
+    首个系统镜像下载即 [Errno 2] ENOENT）。"""
     req = urllib.request.Request(url, headers={"User-Agent": "lynkco-helper"})
+    os.makedirs(os.path.dirname(dest_file) or ".", exist_ok=True)
     with urllib.request.urlopen(req, timeout=60) as resp, \
             open(dest_file, "wb") as f:
         total = int(resp.headers.get("Content-Length") or 0)
