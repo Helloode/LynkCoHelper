@@ -31,6 +31,13 @@ import time
 import urllib.request
 import zipfile
 
+# CI/管道环境下 stdout 是块缓冲（非 tty），长时间不刷新会显得"卡死"，
+# 强制行缓冲，保证每行进度实时上屏（GitHub Actions 按行切分日志）。
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
 try:
     import pexpect
 except ImportError:
@@ -108,47 +115,68 @@ def adb(*args):
 # 下载工具（两个平台入口共用）
 # ---------------------------------------------------------------------------
 
+def _fmt_dur(seconds):
+    """秒数 -> "3分12秒 / 45秒" 可读时长。"""
+    s = int(seconds)
+    return f"{s // 60}分{s % 60}秒" if s >= 60 else f"{s}秒"
+
+
+def _download_to(url, dest_file, interval=10):
+    """流式下载并按时间间隔输出换行结尾的进度行。
+
+    进度行包含 百分比/MB/瞬时速度/预计剩余，每 interval 秒最多一行：
+    CI 日志按行刷新（\r 单行刷新在 Actions 里不可见，大文件会全程静默），
+    本地终端也不会被刷屏。连接与读均有 60 秒超时，避免 stall 挂死。"""
+    req = urllib.request.Request(url, headers={"User-Agent": "lynkco-helper"})
+    with urllib.request.urlopen(req, timeout=60) as resp, \
+            open(dest_file, "wb") as f:
+        total = int(resp.headers.get("Content-Length") or 0)
+        done = 0
+        t0 = last_t = time.time()
+        last_done = 0
+        while True:
+            chunk = resp.read(262144)
+            if not chunk:
+                break
+            f.write(chunk)
+            done += len(chunk)
+            now = time.time()
+            if now - last_t >= interval:
+                speed = (done - last_done) / (now - last_t) / 1048576
+                if total:
+                    eta = (total - done) / max(speed, 0.01) / 1048576
+                    print(f"    进度 {done * 100 // total}%"
+                          f"（{done // 1048576}/{total // 1048576}MB）"
+                          f"  {speed:.1f}MB/s  剩余 ~{_fmt_dur(eta)}")
+                else:
+                    print(f"    已下载 {done // 1048576}MB  {speed:.1f}MB/s")
+                last_t, last_done = now, done
+        dt = time.time() - t0
+        avg = done / 1048576 / max(dt, 0.01)
+        print(f"    下载完成：{done // 1048576}MB  平均 {avg:.1f}MB/s  耗时 {_fmt_dur(dt)}")
+
+
 def _download(url, dest_file, size_mb):
-    """下载文件并显示粗略进度。"""
+    """下载文件（失败退出），进度每 10 秒一行。"""
     print(f"[*] 下载 {url}（约 {size_mb}MB，视网络可能需数分钟）")
-    state = {"last": -1}
-
-    def hook(count, block, total):
-        pct = int(count * block * 100 / total) if total > 0 else 0
-        if pct != state["last"] and pct % 5 == 0:
-            state["last"] = pct
-            print(f"    {pct}%", end="\r")
-
     try:
-        urllib.request.urlretrieve(url, dest_file, reporthook=hook)
+        _download_to(url, dest_file)
     except Exception as e:
         if os.path.exists(dest_file):
             os.remove(dest_file)
         sys.exit(f"[!] 下载失败：{e}\n    可手动下载 {url} 解压到 {TOOLS_DIR} 后重跑")
-    print("    100% - 完成          ")
 
 
 def _try_download(url, dest_file, size_mb):
-    """尝试下载（软失败返回 False，供多镜像回退）。"""
+    """尝试下载（软失败返回 False，供多镜像回退），进度每 10 秒一行。"""
     print(f"[*] 尝试 {url}（约 {size_mb}MB）")
     try:
-        resp = urllib.request.urlopen(url, timeout=60)
-    except Exception as e:
-        print(f"    [跳过] {e}")
-        return False
-    try:
-        with open(dest_file, "wb") as f:
-            while True:
-                chunk = resp.read(65536)
-                if not chunk:
-                    break
-                f.write(chunk)
+        _download_to(url, dest_file)
     except Exception as e:
         if os.path.exists(dest_file):
             os.remove(dest_file)
         print(f"    [失败] {e}")
         return False
-    print("    - 完成")
     return True
 
 
@@ -177,10 +205,30 @@ def _extract_jdk_and_find_jdb(arc, dest):
     return hits[0]
 
 
+def _app_installed(tries=6, wait=5):
+    """确认设备上领克 App 的安装状态，返回 True/False；持续查询失败则退出。
+
+    pm path 的“未安装”与 adb 传输故障（设备闪断/多设备/adbd 未就绪）
+    退出码与 stdout 完全一致（exit=1、stdout 空），仅 stderr 可区分；
+    冷启动后 adbd 有一小段不稳窗口，若不加区分，传输抖动会被误判为
+    “未安装”而白下 285MB APK（2026-08-31 macOS 冷启动实测踩坑）。"""
+    for attempt in range(tries):
+        r = subprocess.run([ADB, "shell", "pm", "path", APP],
+                           capture_output=True, text=True)
+        if r.stdout.strip():
+            return True                    # 已安装
+        if not r.stderr.strip():
+            return False                   # pm 正常执行且未找到
+        print(f"    [.] 设备查询不稳（{attempt + 1}/{tries}）："
+              f"{r.stderr.strip().splitlines()[-1]}")
+        time.sleep(wait)
+    sys.exit("[!] adb 持续无法查询设备（见上方错误），请检查 adb devices 后重试")
+
+
 def ensure_apk():
     """设备未装领克 App 时自动安装（平台无关）：查询官方接口拿最新
     版本号，从领克官方 CDN 下载（约 285MB，已下载则复用）后 adb install。"""
-    if adb("shell", "pm", "path", APP).strip():
+    if _app_installed():
         return
     try:
         data = json.loads(urllib.request.urlopen(LYNKCO_VER_API, timeout=15).read())
@@ -200,7 +248,7 @@ def ensure_apk():
     out = adb("install", "-r", apk)
     if out:
         print(f"    {out.splitlines()[-1]}")
-    if not adb("shell", "pm", "path", APP).strip():
+    if not _app_installed():
         sys.exit(f"[!] APK 安装后仍未检测到 {APP}，请人工检查")
 
 
@@ -222,26 +270,58 @@ def cold_start_and_wait(emu, avd):
         print(f"[*] 冷启动模拟器 {avd}（-no-snapshot-load，约需 1~2 分钟）...")
     env = os.environ.copy()
     sdk_root = os.path.dirname(os.path.dirname(emu))
-    env.setdefault("ANDROID_HOME", sdk_root)
-    env.setdefault("ANDROID_SDK_ROOT", sdk_root)
-    if sys.platform == "darwin":
-        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # 必须覆盖而非 setdefault：CI runner（如 GitHub ubuntu-latest）预设了
+    # ANDROID_HOME=/usr/local/lib/android/sdk，而 AVD 的 image.sysdir.1 是
+    # 相对路径，模拟器按该变量解析系统镜像位置——指向别的 SDK 会启动即失败
+    # （adb wait-for-device 干等 5 分钟超时，2026-08-31 CI 实测踩坑）。
+    env["ANDROID_HOME"] = sdk_root
+    env["ANDROID_SDK_ROOT"] = sdk_root
+    log_file = os.path.join(TOOLS_DIR, "emulator.log")
+    if sys.platform == "darwin" and not headless:
+        # macOS 窗口模式：界面即状态，输出丢弃
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, env=env)
     else:
-        log_file = os.path.join(TOOLS_DIR, "emulator.log")
+        # 无头模式（含全部 Linux/CI、macOS EMU_HEADLESS=1）：输出落盘，
+        # 失败时由 _fail() 把末尾打到 stdout
+        os.makedirs(TOOLS_DIR, exist_ok=True)
         with open(log_file, "wb") as lf:
-            subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, env=env)
+            proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT,
+                                    env=env)
+
+    def _fail(reason):
+        """失败时带上 emulator.log 末尾再退出：CI runner 用后即焚，
+        只留一句"日志见某路径"等于没有日志；顺带终止残留的模拟器进程。"""
+        proc.terminate()
+        log_file = os.path.join(TOOLS_DIR, "emulator.log")
+        if os.path.exists(log_file):
+            try:
+                with open(log_file, "rb") as f:
+                    lines = f.read()[-4000:].decode("utf-8", "replace").splitlines()
+                lines = [ln for ln in lines[-30:] if ln.strip()]
+                if lines:
+                    print(f"[!] {reason}，emulator.log 末尾 {len(lines)} 行：")
+                    for ln in lines:
+                        print(f"    | {ln}")
+            except Exception:
+                pass
+        sys.exit(f"[!] {reason}")
+
+    print("[*] 等待 adb 连接模拟器（最多 5 分钟）...")
     try:
         subprocess.run([ADB, "wait-for-device"], capture_output=True, timeout=300)
     except subprocess.TimeoutExpired:
-        sys.exit("[!] adb 连接模拟器超时（5 分钟），"
-                 f"日志见 {TOOLS_DIR}/emulator.log")
-    for _ in range(240):   # 最多等 8 分钟（CI 首次开机较慢）
+        _fail("adb 连接模拟器超时（5 分钟）")
+    for i in range(240):   # 最多等 8 分钟（CI 首次开机较慢）
         if adb("shell", "getprop", "sys.boot_completed").strip() == "1":
             print("[+] 模拟器启动完成")
             time.sleep(5)  # 等 adbd / am 就绪，避免首轮 am start 拿不到 PID
             return
         time.sleep(2)
-    sys.exit("[!] 模拟器启动超时，请手动冷启动后重试。")
+        if i and i % 15 == 0:   # 每 30 秒一行心跳，CI 日志不静默
+            print(f"[*] 仍在等待系统启动（已 {i * 2} 秒，"
+                  f"模拟器日志 {TOOLS_DIR}/emulator.log）...")
+    _fail("模拟器启动超时（8 分钟）")
 
 
 # ---------------------------------------------------------------------------

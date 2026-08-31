@@ -185,6 +185,8 @@ def _download_and_extract(pkg_name, dest_dir, size_mb):
     arc = os.path.join(core.TOOLS_DIR, os.path.basename(pkg_name))
     for base in _PKG_MIRRORS:
         if core._try_download(base + pkg_name, arc, size_mb):
+            print(f"[*] 解压 {os.path.basename(pkg_name)} 到 {dest_dir}"
+                  f"（约 {size_mb}MB，可能需 1~3 分钟）...")
             os.makedirs(dest_dir, exist_ok=True)
             with zipfile.ZipFile(arc) as z:
                 z.extractall(dest_dir)
