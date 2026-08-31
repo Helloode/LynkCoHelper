@@ -66,19 +66,28 @@ _AVD_NAME = "lynkco_helper_avd"
 
 _IS_MAC = sys.platform == "darwin"
 
-# 平台参数：镜像 ABI 恒为 arm64-v8a（App 硬约束）；emulator 包、
-# platform-tools 与 Corretto 包按宿主平台选
+# 镜像参数：ABI 恒为 arm64-v8a（App 硬约束）；API 用 33（本地 Mac 实测
+# 验证过的版本，提取流程与 API 级别无关，文档 7.1 节亦确认 31~34 均可）
 _ABI = "arm64-v8a"
-_SYSIMG_PKG_RE = r"(arm64-v8a-34_r\d+\.zip)"
-_SYSIMG_FALLBACK = "sys-img/google_apis/arm64-v8a-34_r14.zip"
-_SYSIMG_MB = 1200
+_API = "33"
+_SYSIMG_PKG_RE = r"(arm64-v8a-33_r\d+\.zip)"
+_SYSIMG_FALLBACK = "sys-img/google_apis/arm64-v8a-33_r17.zip"
+_SYSIMG_MB = 1700
 if _IS_MAC:
+    # Mac 用最新 darwin_aarch64 包（HVF 硬件虚拟化，快）
     _EMU_PKG_RE = r"(emulator-darwin_aarch64-\d+\.zip)"
+    _EMU_PKG_PIN = None
+    _EMU_MB = 350
     _PT_ZIP = "platform-tools-latest-darwin.zip"
     _CORRETTO_PKG = "amazon-corretto-8-aarch64-macos-jdk.tar.gz"
 else:
-    # x64 emulator 包自带 qemu-system-aarch64（arm64 guest 走全系统 TCG）
-    _EMU_PKG_RE = r"(emulator-linux_x64-\d+\.zip)"
+    # Linux 必须钉住 31.3.10：37.x 启动器硬性拒绝跨架构（"Avd's CPU
+    # Architecture 'arm64' is not supported by the QEMU2 emulator on
+    # x86_64 host"，run 33365171562 实测）；31.3.10 无此检查且包内自带
+    # qemu-system-aarch64，x86_64 宿主跑 arm64 镜像走全系统 TCG（慢但稳）
+    _EMU_PKG_RE = r"(emulator-linux_x64-8807927\.zip)"
+    _EMU_PKG_PIN = "emulator-linux_x64-8807927.zip"   # 31.3.10
+    _EMU_MB = 280
     _PT_ZIP = "platform-tools-latest-linux.zip"
     _CORRETTO_PKG = "amazon-corretto-8-x64-linux-jdk.tar.gz"
 
@@ -129,8 +138,9 @@ def ensure_jdb():
 # ---------------------------------------------------------------------------
 
 def _fetch_latest_pkg_names():
-    """从 Google repository XML 获取最新的 emulator 与 google_apis 系统镜像
-    包名，返回 (emulator_pkg, sysimg_pkg)。两者分属不同 XML：emulator 在
+    """获取 emulator 与 google_apis 系统镜像包名，返回 (emulator_pkg,
+    sysimg_pkg)。Linux 上 emulator 钉死 31.3.10（_EMU_PKG_PIN，原因见
+    平台参数区），不经 XML；其余从 repository XML 动态取：emulator 在
     repository2-3.xml，系统镜像在 sys-img/google_apis/sys-img2-3.xml
     （只在主 XML 里找镜像永远找不到）。单项失败不影响另一项。
     同一包在 XML 中有多个通道（stable/beta/canary）各一块，只取 stable
@@ -149,8 +159,12 @@ def _fetch_latest_pkg_names():
         hits = re.findall(pattern, text)   # 无 stable 块时回退全文匹配
         return hits[-1] if hits else None
 
-    emu_pkg = _grep("https://dl.google.com/android/repository/repository2-3.xml",
-                    _EMU_PKG_RE)
+    if _EMU_PKG_PIN:
+        emu_pkg = _EMU_PKG_PIN
+    else:
+        emu_pkg = _grep("https://dl.google.com/android/repository/repository2-3.xml",
+                        _EMU_PKG_RE)
+
     sysimg = _grep("https://dl.google.com/android/repository/"
                    "sys-img/google_apis/sys-img2-3.xml",
                    _SYSIMG_PKG_RE)
@@ -195,10 +209,10 @@ def _create_avd_manual(avd_name):
         f.write("avd.ini.encoding=UTF-8\n")
         f.write(f"path={avd_dir}\n")
         f.write(f"path.rel=avd/{avd_name}.avd\n")
-        f.write("target=android-34\n")
+        f.write(f"target=android-{_API}\n")
     with open(os.path.join(avd_dir, "config.ini"), "w", encoding="utf-8") as f:
         f.write("avd.ini.encoding=UTF-8\n")
-        f.write(f"image.sysdir.1=system-images/android-34/google_apis/{_ABI}/\n")
+        f.write(f"image.sysdir.1=system-images/android-{_API}/google_apis/{_ABI}/\n")
         f.write("tag.id=google_apis\n")
         f.write("tag.display=Google APIs\n")
         f.write(f"abi.type={_ABI}\n")
@@ -247,6 +261,21 @@ def _emu_supports_arm64_guests(emu):
     return bool(hits)
 
 
+def _emu_allows_cross_arch(emu):
+    """Linux 复用本机 emulator 的版本护栏：37.x 起启动器硬性拒绝
+    arm64 AVD 在 x86_64 宿主上启动（run 33365171562 实测 FATAL）；
+    31.3.10（<32）无此检查。版本探测失败时保守返回 False（弃用，改用
+    钉住的 31.3.10 自下载包）。"""
+    try:
+        out = core.sh([emu, "-version"])
+    except Exception:
+        return False
+    m = re.search(r"emulator version (\d+)\.(\d+)", out)
+    if not m:
+        return False
+    return int(m.group(1)) < 32
+
+
 def ensure_emulator(existing_emu=None):
     """自动下载 emulator + 系统镜像并创建 AVD（镜像约 1.2GB）。
     返回 (emulator_path, avd_name)。下载前先做硬件加速预检。
@@ -255,31 +284,34 @@ def ensure_emulator(existing_emu=None):
     自带 qemu-system-aarch64）。"""
     sdk_root = os.path.join(core.TOOLS_DIR, "sdk")
     emu = os.path.join(sdk_root, "emulator", "emulator")
-    if existing_emu and _emu_supports_arm64_guests(existing_emu):
+    if existing_emu and _emu_supports_arm64_guests(existing_emu) and (
+            _IS_MAC or _emu_allows_cross_arch(existing_emu)):
         emu = existing_emu
         sdk_root = os.path.dirname(os.path.dirname(emu))
     elif existing_emu:
-        print("[*] 现有 emulator 不带 qemu-system-aarch64（无法承载 arm64 "
-              "guest），改用自下载的官方 emulator 包 ...")
+        why = ("不带 qemu-system-aarch64（无法承载 arm64 guest）"
+               if not _emu_supports_arm64_guests(existing_emu)
+               else "≥ 32.x（会拒绝 arm64 AVD 跨架构启动）")
+        print(f"[*] 现有 emulator {why}，改用自下载的官方 emulator 包 ...")
     else:
         print("[*] 未找到 emulator，开始自动安装 ...")
     os.makedirs(sdk_root, exist_ok=True)
 
     _ensure_acceleration()
 
-    sysimg_dir = os.path.join(sdk_root, "system-images", "android-34",
+    sysimg_dir = os.path.join(sdk_root, "system-images", f"android-{_API}",
                               "google_apis", _ABI)
     emu_pkg, sysimg_pkg = None, None
     if not os.path.exists(emu) or not os.path.exists(sysimg_dir):
         emu_pkg, sysimg_pkg = _fetch_latest_pkg_names()
 
-    # 1. emulator（约 350MB）
+    # 1. emulator（Mac 最新包约 350MB；Linux 钉住的 31.3.10 约 280MB）
     if not os.path.exists(emu):
         if not emu_pkg:
             sys.exit("[!] 无法获取 emulator 包名（repository XML 不可达），"
                      "请手动安装 Android SDK 后重试。")
-        print(f"[*] 下载 emulator ({emu_pkg}, 约 350MB)...")
-        if not _download_and_extract(emu_pkg, sdk_root, 350):
+        print(f"[*] 下载 emulator ({emu_pkg}, 约 {_EMU_MB}MB)...")
+        if not _download_and_extract(emu_pkg, sdk_root, _EMU_MB):
             sys.exit(f"[!] emulator 下载失败，可手动下载解压到 {sdk_root}/")
         _make_executable(os.path.join(sdk_root, "emulator"))
     if not os.path.exists(emu):
@@ -296,7 +328,7 @@ def ensure_emulator(existing_emu=None):
             z.extractall(sdk_root)
         os.remove(arc)
 
-    # 3. 系统镜像（API 34 Google APIs，ABI 见 _ABI）
+    # 3. 系统镜像（API 33 Google APIs，ABI 恒为 arm64-v8a）
     if not os.path.exists(sysimg_dir):
         # 上次运行可能解压到错误位置（sdk_root/<ABI>），先归位
         wrong_dir = os.path.join(sdk_root, _ABI)

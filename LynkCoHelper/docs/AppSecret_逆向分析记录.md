@@ -475,6 +475,14 @@ python3 LynkCoHelper/tools/extract_appsecret.py <AVD名字>  # 指定要冷启�
 >    就是 arm64 Android，App 的加固壳跑真 ARM64 指令（逐条翻译），
 >    无 libndk 翻译层、不会崩溃；代价是慢（冷启动 20~50 分钟），
 >    boot 超时已放宽到 50 分钟，工作流 timeout 180 分钟。
+>    ⚠️ Linux 上 emulator 必须**钉住 31.3.10**（build 8807927，脚本已固定
+>    包名不经 XML 解析）：37.x 启动器硬性拒绝跨架构启动（run 33365171562
+>    实测 FATAL "Avd's CPU Architecture 'arm64' is not supported by the
+>    QEMU2 emulator on x86_64 host"——讽刺的是包里明明带着
+>    qemu-system-aarch64）；31.3.10 无此检查，且当年这正是 Google 官方
+>    支持的用法。镜像统一用 API 33 google_apis（arm64-v8a-33_r17.zip，
+>    1.7GB，双镜像源均有），与 31.3.10 同时代且本地 Mac 验证过同一
+>    API 级别。
 > 已排除的路线（勿再踩）：ubuntu+x86_64 镜像（libndk 下加固壳必崩）；
 > macos runner——VM 内无 Hypervisor.framework（actions/runner-images#13505），
 > 且 Android emulator 的 arm64 guest 在 macOS 上死绑 HVF（37.1.11 实测：
