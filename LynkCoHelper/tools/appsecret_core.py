@@ -381,17 +381,25 @@ def cold_start_and_wait(emu, avd):
     env["ANDROID_HOME"] = sdk_root
     env["ANDROID_SDK_ROOT"] = sdk_root
     log_file = os.path.join(TOOLS_DIR, "emulator.log")
+    log_monitored = False   # 无头路径才有落盘日志可监听
     if sys.platform == "darwin" and not headless:
-        # macOS 窗口模式：界面即状态，输出丢弃
+        # macOS 窗口模式：界面即状态，输出丢弃；清掉上次运行的残留日志，
+        # 避免 _fail() 打印陈旧的 PANIC 误导排查
+        if os.path.exists(log_file):
+            try:
+                os.remove(log_file)
+            except OSError:
+                pass
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, env=env)
     else:
         # 无头模式（含全部 Linux/CI、macOS EMU_HEADLESS=1）：输出落盘，
-        # 失败时由 _fail() 把末尾打到 stdout
+        # 失败时由 _fail() 把末尾打到 stdout，等待期由 _emulator_died() 监听
         os.makedirs(TOOLS_DIR, exist_ok=True)
         with open(log_file, "wb") as lf:
             proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT,
                                     env=env)
+        log_monitored = True
 
     def _fail(reason):
         """失败时带上 emulator.log 末尾再退出：CI runner 用后即焚，
@@ -411,16 +419,54 @@ def cold_start_and_wait(emu, avd):
                 pass
         sys.exit(f"[!] {reason}")
 
-    print("[*] 等待 adb 连接模拟器...")
-    try:
-        subprocess.run([ADB, "wait-for-device"], capture_output=True,
-                       timeout=600 if SLOW_VM else 300)
-    except subprocess.TimeoutExpired:
-        _fail("adb 连接模拟器超时（%d 分钟）" % (10 if SLOW_VM else 5))
+    def _emulator_died():
+        """模拟器进程退出或日志报 PANIC/FATAL 即刻判死，返回原因字符串；
+        活着返回 None。run 33368243194 踩坑：模拟器启动 1 秒即 PANIC
+        "Broken AVD system path"，等待逻辑却干等 adb 满 10 分钟才超时
+        发现——秒级失败要秒级退出，别把时间浪费在必死等待上。"""
+        if proc.poll() is not None:
+            return f"模拟器进程已退出（exit={proc.returncode}）"
+        if not log_monitored:
+            return None
+        try:
+            with open(log_file, "rb") as f:
+                tail = f.read()[-4000:].decode("utf-8", "replace")
+        except OSError:
+            return None
+        for ln in tail.splitlines():
+            if re.search(r"(?i)^\s*(panic|fatal)\b", ln):
+                return f"模拟器启动失败：{ln.strip()[:160]}"
+        return None
+
+    # 连接等待：不用 adb wait-for-device 一次性干等——它对“模拟器已死”
+    # 毫无感知（TCG 下要白等满超时窗口）。改为 5 秒一轮：get-state 变
+    # device 即连接成功；进程退出 / 日志 PANIC/FATAL 立刻带日志退出。
+    print("[*] 等待 adb 连接模拟器（进程崩溃/日志报错即刻失败）...")
+    connect_timeout = 600 if SLOW_VM else 300
+    waited = 0
+    connected = False
+    while waited <= connect_timeout:
+        died = _emulator_died()
+        if died:
+            _fail(died)
+        if subprocess.run([ADB, "get-state"], capture_output=True,
+                          text=True).stdout.strip() == "device":
+            connected = True
+            break
+        time.sleep(5)
+        waited += 5
+        if waited % 60 == 0:
+            print(f"[*] 仍在等待 adb 连接模拟器（已 {waited // 60} 分钟，"
+                  "TCG 冷启动慢属预期）...")
+    if not connected:
+        _fail("adb 连接模拟器超时（%d 分钟）" % (connect_timeout // 60))
     # TCG 全系统模拟（Linux x86_64 宿主跑 arm64 镜像）冷启动慢得多，
     # boot 超时 8 -> 50 分钟；macOS HVF 原生路径维持 8 分钟
     boot_polls = 1500 if SLOW_VM else 240
     for i in range(boot_polls):
+        died = _emulator_died()   # 启动中崩溃/报错也要即刻退出，别傻等满超时
+        if died:
+            _fail(died)
         if adb("shell", "getprop", "sys.boot_completed").strip() == "1":
             print("[+] 模拟器启动完成")
             # 等 adbd / am 就绪，避免首轮 am start 拿不到 PID（TCG 下更保守）

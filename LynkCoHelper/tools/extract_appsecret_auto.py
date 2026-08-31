@@ -328,6 +328,13 @@ def ensure_emulator(existing_emu=None):
             z.extractall(sdk_root)
         os.remove(arc)
 
+    # 2b. 31.3.10 的 SDK 根校验还要求 platforms/ 子目录存在（37.x 不查），
+    #     缺失即 WARN "invalid sdk root" -> PANIC "Broken AVD system path"
+    #     （run 33368243194 实测）。空目录即可通过校验：模拟器启动只用
+    #     system-images，platforms 里的 android.jar 是编译期产物，启动不读。
+    plat_dir = os.path.join(sdk_root, "platforms", f"android-{_API}")
+    os.makedirs(plat_dir, exist_ok=True)
+
     # 3. 系统镜像（API 33 Google APIs，ABI 恒为 arm64-v8a）
     if not os.path.exists(sysimg_dir):
         # 上次运行可能解压到错误位置（sdk_root/<ABI>），先归位

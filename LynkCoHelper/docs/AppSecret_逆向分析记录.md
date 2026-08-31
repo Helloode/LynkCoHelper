@@ -482,7 +482,12 @@ python3 LynkCoHelper/tools/extract_appsecret.py <AVD名字>  # 指定要冷启�
 >    qemu-system-aarch64）；31.3.10 无此检查，且当年这正是 Google 官方
 >    支持的用法。镜像统一用 API 33 google_apis（arm64-v8a-33_r17.zip，
 >    1.7GB，双镜像源均有），与 31.3.10 同时代且本地 Mac 验证过同一
->    API 级别。
+>    API 级别。31.3.10 的 SDK 根校验还要求 platforms/ 子目录存在
+>    （37.x 已不查，本地最小 SDK 实测复现/解除），脚本自建空目录
+>    platforms/android-33/ 即可通过——启动只用 system-images，不读
+>    platforms 内容。等待逻辑也已改为 5 秒一轮探测（进程存活 + 日志
+>    PANIC/FATAL + adb get-state），秒级失败秒级退出，不再干等超时
+>    （run 33368243194 踩坑：启动 1 秒即 PANIC 却白等 adb 满 10 分钟）。
 > 已排除的路线（勿再踩）：ubuntu+x86_64 镜像（libndk 下加固壳必崩）；
 > macos runner——VM 内无 Hypervisor.framework（actions/runner-images#13505），
 > 且 Android emulator 的 arm64 guest 在 macOS 上死绑 HVF（37.1.11 实测：
@@ -556,6 +561,8 @@ CI 工作流另支持可选 Secret `LYNKCO_PAT`（具备本仓库 Secret 写权�
 | `上游握手失败`（重试 3 次仍失败） | AVD 用了 Google Play 镜像，或模拟器以快照方式启动（4.5 节坑 1/坑 2） | 换 **Google APIs** 镜像重建 AVD（见 7.1 第 1 步）；若自己手动开过模拟器请关掉，让脚本自动冷启动（脚本自启的 AVD 必为冷启动） |
 | `未命中断点` / 提取值一直为空 | App 大版本更新、混淆类名变了 | 按第 1 节思路用新版 APK 重新静态分析，修改脚本头部 `CLASS` 常量；手动逐段定位可参考 4.3 节的 jdb 命令序列 |
 | `目标 VM 断开`（App 反调试自杀） | 调试暴露过久或平台连接不稳 | 脚本会自动重试；3 次均失败多为连接不稳，冷启动模拟器后重跑 |
+| `PANIC: Broken AVD system path` | SDK 根缺 `platforms/` 子目录（31.3.10 校验，37.x 不查） | 脚本已自建空 `platforms/android-<API>/`；自备 SDK 时确保该目录存在 |
+| 模拟器启动失败（带 PANIC/FATAL 日志末尾） | 模拟器秒挂，等待逻辑 5 秒一轮探测即刻发现并带日志退出 | 看日志末尾的具体报错，对照本表或第 4.5 节踩坑记录排查 |
 
 > 曾有的"手动 10 步教程"已随脚本完善而移除：手动直连依赖在进程 fork 后
 > 0.5s 内完成 JDWP 握手（4.5 节坑 2），多数环境人工根本赶不上，作为兜底
