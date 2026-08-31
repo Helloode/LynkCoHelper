@@ -181,7 +181,11 @@ def _try_download(url, dest_file, size_mb):
 
 
 def _confirm_download(kind, size_mb, dest):
+    """交互确认下载；非交互环境（CI/管道，stdin 非 tty 或 EOF）自动同意。"""
     try:
+        if not sys.stdin.isatty():
+            print(f"[*] 未找到 {kind}（非交互环境，自动下载约 {size_mb}MB -> {dest}）")
+            return True
         ans = input(f"[*] 未找到 {kind}，是否自动下载（约 {size_mb}MB -> {dest}）？[Y/n]: ")
     except EOFError:
         ans = "y"
@@ -512,6 +516,32 @@ def maybe_write_env(key, secret):
 # 单次提取 + 主循环（平台无关）
 # ---------------------------------------------------------------------------
 
+def _dump_device_diagnostics(tag):
+    """提取失败时采集设备侧证据（进程存活/ABI 支持/logcat 崩溃缓冲）。
+    CI runner 用后即焚，不现场抓证据就只能事后猜：2026-08-31 CI 实测三次
+    握手超时却无任何设备侧信息，根因（如 APK 仅 arm64-v8a 与 x86_64 模拟器
+    不兼容导致进程启动即死）完全无法定位。"""
+    print(f"[*] 设备侧诊断（{tag}）：")
+    try:
+        alive = adb("shell", "pidof", APP).strip()
+        print(f"    App 进程: {alive or '已退出（启动即崩溃的典型特征）'}")
+    except Exception:
+        pass
+    try:
+        print(f"    设备 ABI: {adb('shell', 'getprop', 'ro.product.cpu.abilist').strip()}")
+    except Exception:
+        pass
+    try:
+        crash = adb("shell", "logcat", "-d", "-b", "crash", "-t", "60")
+        if crash.strip():
+            print("    logcat 崩溃缓冲尾部：")
+            for ln in crash.splitlines()[-25:]:
+                print(f"    | {ln}")
+        else:
+            print("    logcat 崩溃缓冲为空（进程非崩溃退出，或未被拉起）")
+    except Exception:
+        pass
+
 def run_once():
     """单次完整提取；连接类故障抛 Disconnected 交由主循环重试。返回 (key, secret)。"""
     proxy = Proxy()
@@ -534,7 +564,10 @@ def run_once():
         # 启动 App（等待调试器状态），进程一出现立刻建立 forward 并放行代理
         adb("shell", "am", "force-stop", APP)
         time.sleep(0.5)
-        adb("shell", "am", "start", "-D", "-n", ACTIVITY)
+        started = adb("shell", "am", "start", "-D", "-n", ACTIVITY)
+        for ln in started.splitlines():
+            if ln.strip():
+                print(f"    am start: {ln.strip()}")
         t0 = time.time()
         pid = None
         for _ in range(300):   # 约 9s，冷启动后 App 起得慢也等得到
@@ -545,13 +578,17 @@ def run_once():
                 break
             time.sleep(0.03)
         if not pid:
+            _dump_device_diagnostics("未取到 App PID")
             raise Disconnected("未取到 App PID：请确认模拟器已安装领克 App"
                                "（adb shell pm list packages | grep lynkco）")
         print(f"[*] PID={pid} (t={time.time()-t0:.2f}s)，立即建立转发 ...")
         adb("forward", f"tcp:{UPSTREAM_PORT}", f"jdwp:{pid}")
         proxy.upstream_ready.set()
 
-        if not proxy.handshake_done.wait(timeout=15):
+        # 新装 285MB App 首启需 dex 校验，模拟器负载高时 VM 达到等待调试器
+        # 状态可能较慢，给足 30 秒（原 15 秒在 2026-08-31 CI 实测不够）
+        if not proxy.handshake_done.wait(timeout=30):
+            _dump_device_diagnostics("上游握手失败")
             raise Disconnected("上游握手失败（可能错过早期窗口）。"
                                "若模拟器非冷启动，请按文档 4.5 节坑 1 冷启动后重试")
         print("[+] JDWP 握手完成（命中早期窗口）！\n")
