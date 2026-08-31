@@ -7,8 +7,9 @@ extract_appsecret_auto.py —— 全自动版（CI / 无本地 Android 环境的
 领克 APK 仅含 arm64-v8a 原生库，x86_64 模拟器靠 libndk 翻译执行 ARM
 代码时其加固壳必崩（SIGSEGV，2026-08-31 ubuntu runner 三次实测），
 Linux x86_64 路线已废弃（对领克 App 必败，维护无意义）。GitHub Actions
-macos-latest runner 实测路径：runner 预装 emulator/adb/JDK（直接复用），
-仅需下载 arm64-v8a API34 系统镜像（约 1.2GB）与 APK。
+macos-latest runner 实测路径：复用 runner 预装的 adb/JDK，但其预装
+emulator 是 x86_64 包（无法承载 arm64 guest），需自下载
+emulator-darwin_aarch64 + arm64-v8a API34 系统镜像（约 1.2GB）与 APK。
 
 用法（在仓库根目录执行，详见文档第 7 节）：
   python3 LynkCoHelper/tools/extract_appsecret_auto.py            # 全自动
@@ -17,7 +18,10 @@ macos-latest runner 实测路径：runner 预装 emulator/adb/JDK（直接复用
 全自动内容（核心流程与 macOS 版共用 appsecret_core.py）：
   1. 前置环境自动探测与下载（存 ~/.lynkco-helper-tools/，二次运行复用）：
      - pexpect 缺失 -> 自动 pip 安装
-     - adb / jdb / emulator 缺失 -> 多镜像源自动下载官方公开源包
+     - adb / jdb 缺失 -> 多镜像源自动下载官方公开源包
+     - emulator：本地已有的（含 arm64 qemu 后端）直接用；否则自下载
+       darwin_aarch64 原生包（GitHub macos runner 预装的是 x86_64 包，
+       启动 arm64 AVD 即失败，不能用）
      - arm64-v8a API34 Google APIs 系统镜像缺失 -> 下载（约 1.2GB）、
        手工创建 AVD（无需 cmdline-tools）
      - 硬件加速检测（下载前做，避免白下镜像才发现起不来）：有 HVF 用
@@ -219,17 +223,34 @@ def _ensure_acceleration():
     os.environ["EMU_ACCEL"] = "off"
 
 
+def _emu_supports_arm64_guests(emu):
+    """检查 emulator 能否承载 arm64 guest：qemu 后端目录需存在
+    qemu/darwin-aarch64/qemu-system-aarch64。
+    GitHub macos runner 预装的是 x86_64 包（launcher 在 Rosetta 下运行），
+    启动 arm64 AVD 即报 "Could not launch .../qemu/darwin-x86_64/
+    qemu-system-aarch64: No such file or directory"（run 33359423830
+    实测），必须改用自下载的 darwin_aarch64 原生包。"""
+    qemu = os.path.join(os.path.dirname(emu), "qemu", "darwin-aarch64",
+                        "qemu-system-aarch64")
+    return os.path.exists(qemu)
+
+
 def ensure_emulator(existing_emu=None):
-    """自动下载 emulator + 系统镜像并创建 AVD（镜像约 1.2~1.5GB）。
-    返回 (emulator_path, avd_name)。下载前先做硬件加速预检。"""
-    if existing_emu:
+    """自动下载 emulator + 系统镜像并创建 AVD（镜像约 1.2GB）。
+    返回 (emulator_path, avd_name)。下载前先做硬件加速预检。
+    现有 emulator 缺 arm64 qemu 后端时（如 GitHub macos runner 预装的
+    x86_64 包）不用它，改用自下载的 darwin_aarch64 原生包。"""
+    sdk_root = os.path.join(core.TOOLS_DIR, "sdk")
+    emu = os.path.join(sdk_root, "emulator", "emulator")
+    if existing_emu and _emu_supports_arm64_guests(existing_emu):
         emu = existing_emu
         sdk_root = os.path.dirname(os.path.dirname(emu))
+    elif existing_emu:
+        print("[*] 现有 emulator 缺 arm64 qemu 后端（GitHub macos runner 预装的"
+              "是 x86_64 包），改用自下载的 darwin_aarch64 原生 emulator ...")
     else:
         print("[*] 未找到 emulator，开始自动安装 ...")
-        sdk_root = os.path.join(core.TOOLS_DIR, "sdk")
-        os.makedirs(sdk_root, exist_ok=True)
-        emu = os.path.join(sdk_root, "emulator", "emulator")
+    os.makedirs(sdk_root, exist_ok=True)
 
     _ensure_acceleration()
 
