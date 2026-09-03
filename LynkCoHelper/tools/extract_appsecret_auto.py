@@ -78,10 +78,15 @@ _ABI = os.environ.get("LYNKCO_IMAGE_ABI", "arm64-v8a")
 if _ABI not in ("arm64-v8a", "x86_64"):
     sys.exit(f"[!] 不支持的 LYNKCO_IMAGE_ABI={_ABI}（可选 arm64-v8a / x86_64）")
 _IS_X86_IMAGE = _ABI == "x86_64"
-_API = "33"
-_SYSIMG_PKG_RE = rf"({_ABI}-33_r\d+\.zip)"
-_SYSIMG_FALLBACK = f"sys-img/google_apis/{_ABI}-33_r17.zip"
-_SYSIMG_MB = 1700 if not _IS_X86_IMAGE else 1000
+# 镜像 API：arm64 用 33（本地 Mac 实测稳定）；x86_64 实验用 34——
+# 已抽取镜像 build.prop 实证：API31/34 的 x86_64 镜像 abilist 含
+# arm64-v8a（带 libndk 翻译，可装 arm64 APK），API33 仅 x86_64
+# （INSTALL_FAILED_NO_MATCHING_ABIS，run 33766293821 实测）
+_API = "34" if _IS_X86_IMAGE else "33"
+_SYSIMG_PKG_RE = rf"({_ABI}-{_API}_r\d+\.zip)"
+_SYSIMG_FALLBACK = f"sys-img/google_apis/{_ABI}-{_API}_r12.zip" \
+    if _IS_X86_IMAGE else "sys-img/google_apis/arm64-v8a-33_r17.zip"
+_SYSIMG_MB = 1700 if not _IS_X86_IMAGE else 1200
 # AVD 名带 ABI 后缀：避免与（可能已存在的）arm64 AVD 配置互相覆盖
 _AVD_NAME = "lynkco_helper_avd" if not _IS_X86_IMAGE else "lynkco_helper_avd_x64"
 if _IS_X86_IMAGE:
