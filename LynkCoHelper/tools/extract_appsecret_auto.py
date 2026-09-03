@@ -3,7 +3,7 @@
 extract_appsecret_auto.py —— 全自动版（CI / 无本地 Android 环境的机器）：
 从零自动提取领克 App 的 nativeAppKey / nativeAppSecret。
 
-支持平台（镜像 ABI 恒为 arm64-v8a——领克 APK 仅含 arm64 原生库）：
+支持平台（默认镜像 ABI 为 arm64-v8a——领克 APK 仅含 arm64 原生库）：
   - macOS Apple Silicon：Hypervisor.framework 原生虚拟化，快；本地
     全自动首选。
   - Linux x86_64（含 GitHub Actions ubuntu runner）：qemu 全系统 TCG
@@ -62,17 +62,32 @@ _PKG_MIRRORS = [
     "https://mirrors.cloud.tencent.com/AndroidSDK/",
 ]
 
-_AVD_NAME = "lynkco_helper_avd"
-
 _IS_MAC = sys.platform == "darwin"
 
-# 镜像参数：ABI 恒为 arm64-v8a（App 硬约束）；API 用 33（本地 Mac 实测
-# 验证过的版本，提取流程与 API 级别无关，文档 7.1 节亦确认 31~34 均可）
-_ABI = "arm64-v8a"
+# 镜像参数：默认 ABI 为 arm64-v8a（App 仅含 arm64 库，壳跑真 ARM64 指令，
+# 2026-08-31 实测稳定）；API 用 33（本地 Mac 实测验证过的版本，提取流程
+# 与 API 级别无关，文档 7.1 节亦确认 31~34 均可）。
+#
+# 实验：LYNKCO_IMAGE_ABI=x86_64（仅 Linux x86_64 宿主）——x86_64 镜像 +
+# KVM 硬件加速，冷启动从 TCG 的 20~50 分钟降到 2~5 分钟；领克的 arm64
+# 库由镜像自带的 libndk 翻译执行。前置观察：App 在该环境下能存活数秒
+# 才被杀（非立即段错误），说明壳的 native 代码可执行、死于环境检测，
+# 理论上 0.5s 抢握手 + 2 次 next 的提取窗口可能赶在自杀前完成——
+# 本开关即为此实测而设，结论以运行结果为准。
+_ABI = os.environ.get("LYNKCO_IMAGE_ABI", "arm64-v8a")
+if _ABI not in ("arm64-v8a", "x86_64"):
+    sys.exit(f"[!] 不支持的 LYNKCO_IMAGE_ABI={_ABI}（可选 arm64-v8a / x86_64）")
+_IS_X86_IMAGE = _ABI == "x86_64"
 _API = "33"
-_SYSIMG_PKG_RE = r"(arm64-v8a-33_r\d+\.zip)"
-_SYSIMG_FALLBACK = "sys-img/google_apis/arm64-v8a-33_r17.zip"
-_SYSIMG_MB = 1700
+_SYSIMG_PKG_RE = rf"({_ABI}-33_r\d+\.zip)"
+_SYSIMG_FALLBACK = f"sys-img/google_apis/{_ABI}-33_r17.zip"
+_SYSIMG_MB = 1700 if not _IS_X86_IMAGE else 1000
+# AVD 名带 ABI 后缀：避免与（可能已存在的）arm64 AVD 配置互相覆盖
+_AVD_NAME = "lynkco_helper_avd" if not _IS_X86_IMAGE else "lynkco_helper_avd_x64"
+if _IS_X86_IMAGE:
+    # x86_64 镜像在 x86_64 宿主上是同架构 KVM 硬件加速虚拟化，不是 TCG，
+    # core 的超时/心跳按 SLOW_VM（linux 即 TCG）放大 10 倍，这里改回常态
+    core.SLOW_VM = False
 if _IS_MAC:
     _EMU_PKG_RE = r"(emulator-darwin_aarch64-\d+\.zip)"
     _EMU_MB = 350
@@ -207,7 +222,10 @@ def _create_avd_manual(avd_name):
     os.makedirs(avd_home, exist_ok=True)
     avd_dir = os.path.join(avd_home, f"{avd_name}.avd")
     os.makedirs(avd_dir, exist_ok=True)
-    target_api = "27" if not _IS_MAC else _API   # Linux 谎报，macOS 保持真实
+    # Linux + arm64 镜像才需要谎报 target（跨架构检查）；x86_64 镜像是
+    # 同架构，保持真实 target
+    _fake_target = (not _IS_MAC) and (not _IS_X86_IMAGE)
+    target_api = "27" if _fake_target else _API
     with open(os.path.join(avd_home, f"{avd_name}.ini"), "w", encoding="utf-8") as f:
         f.write("avd.ini.encoding=UTF-8\n")
         f.write(f"path={avd_dir}\n")
@@ -219,7 +237,7 @@ def _create_avd_manual(avd_name):
         f.write("tag.id=google_apis\n")
         f.write("tag.display=Google APIs\n")
         f.write(f"abi.type={_ABI}\n")
-        f.write("hw.cpu.arch=arm64\n")
+        f.write(f"hw.cpu.arch={'x86_64' if _IS_X86_IMAGE else 'arm64'}\n")
         f.write("hw.cpu.ncore=4\n")
         f.write("hw.ramSize=2048\n")
         f.write("hw.lcd.width=1080\n")
@@ -228,7 +246,9 @@ def _create_avd_manual(avd_name):
         f.write("hw.keyboard=yes\n")
         f.write("hw.gpu.enabled=yes\n")
         f.write("hw.gpu.mode=auto\n")
-        if not _IS_MAC:
+        # hw.sdCard=no 仅 arm 镜像需要（规避 b/174481551：谎报 target=27
+        # 后启动器重新踩 arm 镜像 sdcard 老 bug）；x86_64 镜像无此问题
+        if not _IS_MAC and not _IS_X86_IMAGE:
             f.write("hw.sdCard=no\n")
         # Linux/CI：userdata 2GB 足够（App 285MB 装后 <1GB）；runner 磁盘
         # 紧张，6GB 分区 + 镜像 + 快照有爆盘风险。macOS 本地磁盘宽裕
@@ -410,6 +430,12 @@ def main():
                  "x86_64 Linux（ubuntu runner，qemu 全系统 TCG 模拟）、"
                  "Apple Silicon Mac（HVF 原生）或 arm64 真机（本地版 "
                  "tools/extract_appsecret.py）。")
+    if _IS_X86_IMAGE and (_IS_MAC or platform.machine() != "x86_64"):
+        sys.exit("[!] LYNKCO_IMAGE_ABI=x86_64 实验仅支持 x86_64 Linux 宿主"
+                 "（x86_64 镜像 + KVM + libndk 翻译 arm64 库）。")
+    if _IS_X86_IMAGE:
+        print("[*] 实验模式：x86_64 镜像 + KVM，领克 arm64 库经 libndk 翻译执行。")
+        print("    若壳在 <clinit> 前完成环境检测自杀，本路线即失败（预期内）。")
     core.ensure_pexpect()
     core.setup(ensure_adb(), ensure_jdb())
     print(f"[*] adb: {core.ADB}")
