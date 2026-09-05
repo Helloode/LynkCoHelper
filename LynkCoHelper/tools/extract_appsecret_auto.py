@@ -96,6 +96,7 @@ if _IS_X86_IMAGE:
     # x86_64 镜像在 x86_64 宿主上是同架构 KVM 硬件加速虚拟化，不是 TCG，
     # core 的超时/心跳按 SLOW_VM（linux 即 TCG）放大 10 倍，这里改回常态
     core.SLOW_VM = False
+_EMU_PINNED = ""  # 仅 Linux 分支钉住版本
 if _IS_MAC:
     _EMU_PKG_RE = r"(emulator-darwin_aarch64-\d+\.zip)"
     _EMU_MB = 350
@@ -109,6 +110,12 @@ else:
     # dmesg 实证）。qemu 全系统 TCG 模拟 arm64 guest，冷启动 20~50
     # 分钟属预期
     _EMU_PKG_RE = r"(emulator-linux_x64-\d+\.zip)"
+    # 钉住 31.3.10 (build 8807927)：37.1.11 启动器的新跨架构检查
+    # "QEMU2 emulator does not support arm64 CPU architecture" 不看 AVD 根
+    # ini 的 target 谎报（run 33958669929 实测 FATAL），31.3.10 的检查只在
+    # "arm64 且 apiLevel>=28" 时触发，可被 target=android-27 谎报绕过
+    # （文档 4.5 节实证可 boot）。
+    _EMU_PINNED = "emulator-linux_x64-8807927.zip"
     _EMU_MB = 350
     _PT_ZIP = "platform-tools-latest-linux.zip"
     _CORRETTO_PKG = "amazon-corretto-8-x64-linux-jdk.tar.gz"
@@ -180,8 +187,8 @@ def _fetch_latest_pkg_names():
         hits = re.findall(pattern, text)   # 无 stable 块时回退全文匹配
         return hits[-1] if hits else None
 
-    emu_pkg = _grep("https://dl.google.com/android/repository/repository2-3.xml",
-                    _EMU_PKG_RE)
+    emu_pkg = _EMU_PINNED or _grep("https://dl.google.com/android/repository/repository2-3.xml",
+                                   _EMU_PKG_RE)
     sysimg = _grep("https://dl.google.com/android/repository/"
                    "sys-img/google_apis/sys-img2-3.xml",
                    _SYSIMG_PKG_RE)
