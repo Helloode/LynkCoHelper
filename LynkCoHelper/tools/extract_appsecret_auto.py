@@ -115,7 +115,7 @@ else:
     # ini 的 target 谎报（run 33958669929 实测 FATAL），31.3.10 的检查只在
     # "arm64 且 apiLevel>=28" 时触发，可被 target=android-27 谎报绕过
     # （文档 4.5 节实证可 boot）。
-    _EMU_PINNED = "emulator-linux_x64-8807927.zip"
+    _EMU_PINNED = os.environ.get("LYNKCO_EMULATOR_PIN") or "emulator-linux_x64-8807927.zip"
     _EMU_MB = 350
     _PT_ZIP = "platform-tools-latest-linux.zip"
     _CORRETTO_PKG = "amazon-corretto-8-x64-linux-jdk.tar.gz"
