@@ -8,11 +8,8 @@
 2026-07 抓包更新：真正"执行签到"的接口路径已从 /up/api/v1/user/sign 变为
 /up/api/v1/user/sign/upgrade，且改走原生 SDK 签名体系（build_native_signature，
 NATIVE_APP_KEY/SECRET，签名头顺序 x-ca-nonce,x-ca-key,x-ca-timestamp，POST body
-即使是空对象 "{}" 也要计算 Content-MD5）。经实测验证，sweet_security_info/imei/
-gl_user_id/gl_dev_id 等设备风控头并非必需（不带也能 200 成功），故未携带，仅保留
-ca_version/x-requiretoken/User-Agent 等基础头。查询类接口（day/info、
-getContinueDaysAndSignCard）经抓包验证仍是原来的 H5 签名体系（build_signature），
-未受影响。
+即使是空对象 "{}" 也要计算 Content-MD5）。2026-09-08 实测确认积分、签到状态和
+连续签到查询也可使用同一原生签名体系；daily task 不再依赖 H5 签名密钥。
 """
 import json
 import sys
@@ -21,10 +18,8 @@ import requests
 
 from lynkco_common import (
     BASE_URL,
-    DEFAULT_USER_AGENT,
     NATIVE_ANDROID_UA,
     build_native_signature,
-    build_signature,
     mask_sensitive,
     request_with_retry,
 )
@@ -44,21 +39,22 @@ class LynkCoSignClient:
         self.session = requests.Session()
 
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
-        """走 H5 签名体系（build_signature），用于查询类接口。"""
-        # 注意：若请求带 query 参数（GET 的 params），必须一并传给 build_signature
-        # 参与签名计算，否则服务端会返回 400 Invalid Signature。
+        """走已验证的 App 原生签名体系，用于积分和签到查询接口。"""
         extra_headers = kwargs.pop("extra_headers", {})
         url = BASE_URL + path
         resp = request_with_retry(
             self.session, method, url,
             build_headers=lambda: {
-                **build_signature(method, path, query=kwargs.get("params")),
+                **build_native_signature(
+                    method, path, query=kwargs.get("params"),
+                    accept="application/json; charset=utf-8",
+                    content_type="application/json; charset=utf-8",
+                    signature_headers_order="x-ca-nonce,x-ca-key,x-ca-timestamp",
+                ),
                 "token": self.token,
-                "Origin": "https://h5.lynkco.cn",
-                "Referer": "https://h5.lynkco.cn/",
-                "User-Agent": DEFAULT_USER_AGENT,
-                "content-type": "application/json",
-                "Accept": "*/*",
+                "ca_version": "1",
+                "x-requiretoken": "false",
+                "User-Agent": NATIVE_ANDROID_UA,
                 **extra_headers,
             },
             **kwargs,

@@ -2,7 +2,8 @@
 """
 领克App 分享任务脚本。
 
-分享流程横跨"原生签名"和"H5签名"两套认证体系，接口协议细节、已知限制见
+分享流程使用 App 原生签名体系；分享落地页仍需携带 H5 Origin/Referer，但这不
+代表使用 H5 签名。接口协议细节、已知限制见
 docs/分享任务接口说明.md。重要提醒：接口返回 success 不代表真正加分（每日
 有次数上限，重复调用不会重复加分），需自行对比 myEnergy 的 point 字段判断。
 
@@ -16,13 +17,13 @@ import time
 
 import requests
 
+import lynkco_common
 from lynkco_common import (
+    ANDROID_APP_BUILD,
+    APP_VERSION,
     BASE_URL,
     NATIVE_ANDROID_UA,
-    NATIVE_DEVICE_HEADERS,
-    NATIVE_RISK_IMEI,
     build_native_signature,
-    build_signature,
     mask_sensitive,
     request_with_retry,
 )
@@ -30,16 +31,15 @@ from lynkco_login import load_token
 
 # ------------------------- 分享任务相关端点，完整协议见 docs/分享任务接口说明.md -------------------------
 EP_GET_SHARE_CODE = "/app/v1/task/getShareCode"          # 获取本次分享的一次性 shareCode（原生签名）
-EP_SHARE_LOOKUP = "/app/v1/task/shareCodeToUserId"        # 通过 shareCode 反查分享人 userId（H5签名）
-EP_SHARE_CHECK = "/app/v1/task/shareContentContectCheck"  # 分享前置校验，可选步骤（H5签名）
-EP_SHARE_REPORT = "/app/v1/task/shareContentContectReporting"  # 完整版上报，另一账号点开链接后走的三步流程（H5签名）
+EP_SHARE_LOOKUP = "/app/v1/task/shareCodeToUserId"        # 通过 shareCode 反查分享人 userId
+EP_SHARE_CHECK = "/app/v1/task/shareContentContectCheck"  # 分享前置校验，可选步骤
+EP_SHARE_REPORT = "/app/v1/task/shareContentContectReporting"  # 完整版上报，另一账号点开链接后走的三步流程
 # 简化版上报：拿到 getShareCode 返回的 shareCode 后，POST 到该接口即可让服务端
-# 记为"已完成一次分享"，比 lookup+check+report 三步法更直接，单账号即可自己
-# 触发（H5签名，Origin 需为 https://h5.lynkco.com）。
+# 记为"已完成一次分享"，比 lookup+check+report 三步法更直接，单账号即可自己触发。
 EP_SHARE_REPORTING_SIMPLE = "/app/v1/task/shareReporting"
-# 探索广场首页文章流（H5签名），用于动态取最新文章 id，避免固定文章失效。body 需带
-# dynamicSort/uniqueId/refreshType/pageNo 分页参数（抓包自原生请求，H5签名不覆盖
-# body 故可直接复用），否则只返回首屏、命中"文章"类型的概率很低。
+# 探索广场首页文章流，用于动态取最新文章 id，避免固定文章失效。body 需带
+# dynamicSort/uniqueId/refreshType/pageNo 分页参数；否则只返回首屏、命中"文章"
+# 类型的概率很低。
 EP_EXPLORE_SQUARE_INDEX = "/app/explore/home-page/square/index2"
 # get_latest_article() 命中第一篇文章前最多尝试翻的页数。
 EXPLORE_SQUARE_PAGE_COUNT = 5
@@ -79,20 +79,34 @@ class LynkCoShareClient:
         self.session = requests.Session()
 
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
-        """走 H5 签名体系（build_signature）请求 app-api-gw-toc.lynkco.com 网关。"""
+        """走已验证的 App 原生签名体系请求分享/广场接口。"""
         extra_headers = kwargs.pop("extra_headers", {})
+        json_body = kwargs.pop("json", None)
+        body = None
+        if json_body is not None:
+            body = json.dumps(json_body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         url = BASE_URL + path
         resp = request_with_retry(
             self.session, method, url,
             build_headers=lambda: {
-                **build_signature(method, path, query=kwargs.get("params")),
+                **build_native_signature(
+                    method, path, query=kwargs.get("params"),
+                    accept="application/json; charset=utf-8",
+                    content_type="application/json; charset=utf-8",
+                    signature_headers_order="x-ca-nonce,x-ca-key,x-ca-timestamp",
+                    body=body,
+                ),
                 "token": self.token,
+                "ca_version": "1",
+                "x-requiretoken": "false",
+                "User-Agent": NATIVE_ANDROID_UA,
+                **lynkco_common.NATIVE_DEVICE_HEADERS,
+                # 分享上报仍要求 H5 落地页 Origin；这不是 H5 签名。
                 "Origin": "https://h5.lynkco.cn",
                 "Referer": "https://h5.lynkco.cn/",
-                "content-type": "application/json",
-                "Accept": "*/*",
                 **extra_headers,
             },
+            data=body,
             **kwargs,
         )
         try:
@@ -121,12 +135,12 @@ class LynkCoShareClient:
                 "token": self.token,
                 "svcsid": self.token,
                 "ca_version": "1",
-                "appversion": "4.2.3",
-                "appVersionCode": "4.2.3",
-                "appVersionName": "402030320",
+                "appversion": APP_VERSION,
+                "appVersionCode": APP_VERSION,
+                "appVersionName": ANDROID_APP_BUILD,
                 "publicPlatform": "android",
                 "User-Agent": NATIVE_ANDROID_UA,
-                **NATIVE_DEVICE_HEADERS,
+                **lynkco_common.NATIVE_DEVICE_HEADERS,
                 **extra,
             },
             **kwargs,
@@ -188,14 +202,14 @@ class LynkCoShareClient:
         )
         sweet_security_info = json.dumps(
             {
-                "appVersion": "4.2.3", "platform": "android", "battery": "100",
+                "appVersion": APP_VERSION, "platform": "android", "battery": "100",
                 "isCharging": "4", "isSetProxy": "true", "isUsbDebug": "false",
                 "isMockLocation": "false", "isRoot": "false",
                 "appSignature": "4F8393A255313DE42799571ABDF33A60",
                 # channel 为 URL-encoded 后的值（"%E5%90%89%E5%88%A9" = 吉利），
                 # HTTP 头只能是 ASCII 字符，直接放中文会被 requests 库报编码错。
                 "channel": "%E5%90%89%E5%88%A9", "screenResolution": "2400*1080", "brand": "google",
-                "model": "sdk_gphone64_arm64", "imsi": NATIVE_RISK_IMEI,
+                "model": "sdk_gphone64_arm64", "imsi": lynkco_common.NATIVE_RISK_IMEI,
                 "geelyDeviceId": "0de2480e07cefcd852cf3a8dadc822cc", "os": "android",
                 "osVersion": "13", "androidVersion": "33", "networkType": "WIFI",
                 "ip": "10.0.2.16", "wifiName": "AndroidWifi", "wifiSignalLevel": "-50",
@@ -209,7 +223,7 @@ class LynkCoShareClient:
             "risk_type": "1",
             "risk_request_info": risk_request_info,
             "sweet_security_info": sweet_security_info,
-            "imei": NATIVE_RISK_IMEI,
+            "imei": lynkco_common.NATIVE_RISK_IMEI,
             "os": "13",
         }
         if account_id:

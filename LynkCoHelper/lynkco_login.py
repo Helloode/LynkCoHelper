@@ -22,19 +22,22 @@ import uuid
 
 import requests
 
+import lynkco_common
 from lynkco_common import (
-    LOGIN_APP_CODE,
+    ANDROID_APP_BUILD,
+    APP_VERSION,
     NATIVE_ANDROID_UA,
-    NATIVE_APP_CODE,
-    NATIVE_APP_KEY,
     NATIVE_BASE_URL,
-    NATIVE_DEVICE_HEADERS,
     build_native_signature,
     load_env_data,
     save_env_fields,
 )
 
 # ------------------------- refreshToken 续期 -------------------------
+
+# iOS 请求仍沿用其对应的抓包 build 号；Android 版本与 build 统一由
+# lynkco_common 的 APK 元数据常量提供。
+IOS_APP_BUILD = "40203073"
 
 
 def _parse_refresh_response(data: dict, refresh_token_value: str) -> dict:
@@ -70,20 +73,20 @@ def refresh_token_by_appcode(refresh_token_value: str, device_id: str) -> dict:
         "refreshToken": refresh_token_value,
         "deviceId": device_id,
         "deviceType": "IOS",
-        "appVersion": "4.2.0",
+        "appVersion": APP_VERSION,
     }
     headers = {
-        "Authorization": f"APPCODE {NATIVE_APP_CODE}",
+        "Authorization": f"APPCODE {lynkco_common.NATIVE_APP_CODE}",
         "accept": "application/json",
         "content-type": "application/json; charset=UTF-8",
         "publicplatform": "iOS",
         "user-agent": "CA_iOS_SDK_2.0",
         "token": "",
         "gl_dev_id": device_id,
-        "appversioncode": "4.2.0",
-        "appversionname": "40200106",
-        "gl_app_version": "4.2.0",
-        "gl_app_build": "40200106",
+        "appversioncode": APP_VERSION,
+        "appversionname": IOS_APP_BUILD,
+        "gl_app_version": APP_VERSION,
+        "gl_app_build": IOS_APP_BUILD,
         "x-ca-version": "1",
     }
 
@@ -105,7 +108,7 @@ def refresh_token_by_signature(refresh_token_value: str, device_id: str) -> dict
     headers["x-requiretoken"] = "false"
     headers["oauth"] = "false"
     headers["User-Agent"] = NATIVE_ANDROID_UA
-    headers.update(NATIVE_DEVICE_HEADERS)
+    headers.update(lynkco_common.NATIVE_DEVICE_HEADERS)
 
     url = NATIVE_BASE_URL + path
     resp = requests.get(url, params=query, headers=headers, timeout=30)
@@ -147,16 +150,13 @@ EP_SEND_SMS = "/auth/login/sliding/sendSms"
 EP_MOBILE_CODE_LOGIN = "/auth/login/mobileCodeLogin"
 EP_PASSWORD_LOGIN = "/auth/login/sliding/login"
 
-# App 版本相关信息，需与签名头里的 gl_app_version/appVersionCode 等保持一致，
-# 抓包样本版本号，实测网关未强校验必须最新版本。
-APP_VERSION = "4.2.3"
-
-
 def get_security_config(device_id: str) -> dict:
     """第1步：获取极验(Geetest v4)配置（GET /auth/v1/security/config?type=GEE_TEST_V4）。"""
     path = EP_SECURITY_CONFIG
     query = {"type": "GEE_TEST_V4"}
-    ca_headers = {"x-ca-appcode": LOGIN_APP_CODE}
+    # loginAppCode 只服务于滑块登录；在实际调用接口时才读取，避免
+    # refreshToken 续期/每日任务仅导入本模块就被这项可选配置阻塞。
+    ca_headers = {"x-ca-appcode": lynkco_common.LOGIN_APP_CODE}
     headers = build_native_signature(
         "GET", path, query=query,
         accept="application/json; charset=utf-8",
@@ -169,9 +169,9 @@ def get_security_config(device_id: str) -> dict:
     headers["x-refresh-token"] = "true"
     headers["User-Agent"] = NATIVE_ANDROID_UA
     headers["appVersionCode"] = APP_VERSION
-    headers["appVersionName"] = "402030320"
+    headers["appVersionName"] = ANDROID_APP_BUILD
     headers["publicPlatform"] = "android"
-    headers.update(NATIVE_DEVICE_HEADERS)
+    headers.update(lynkco_common.NATIVE_DEVICE_HEADERS)
     headers["gl_dev_id"] = device_id  # 覆盖 NATIVE_DEVICE_HEADERS 里的默认设备id
 
     url = NATIVE_BASE_URL + path
@@ -196,7 +196,9 @@ def validate_geetest(device_id: str, lot_number: str, captcha_output: str,
     }
     body_bytes = json.dumps(body_dict, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
-    ca_headers = {"x-ca-appcode": LOGIN_APP_CODE}
+    # loginAppCode 只服务于滑块登录；在实际调用接口时才读取，避免
+    # refreshToken 续期/每日任务仅导入本模块就被这项可选配置阻塞。
+    ca_headers = {"x-ca-appcode": lynkco_common.LOGIN_APP_CODE}
     headers = build_native_signature(
         "POST", path,
         accept="application/json; charset=utf-8",
@@ -210,9 +212,9 @@ def validate_geetest(device_id: str, lot_number: str, captcha_output: str,
     headers["x-refresh-token"] = "true"
     headers["User-Agent"] = NATIVE_ANDROID_UA
     headers["appVersionCode"] = APP_VERSION
-    headers["appVersionName"] = "402030320"
+    headers["appVersionName"] = ANDROID_APP_BUILD
     headers["publicPlatform"] = "android"
-    headers.update(NATIVE_DEVICE_HEADERS)
+    headers.update(lynkco_common.NATIVE_DEVICE_HEADERS)
     headers["gl_dev_id"] = device_id  # 覆盖 NATIVE_DEVICE_HEADERS 里的默认设备id
 
     url = NATIVE_BASE_URL + path
@@ -237,9 +239,9 @@ def send_login_sms(device_id: str, mobile: str, certify_id: str) -> dict:
     headers["ca_version"] = "1"
     headers["User-Agent"] = NATIVE_ANDROID_UA
     headers["appVersionCode"] = APP_VERSION
-    headers["appVersionName"] = "402030320"
+    headers["appVersionName"] = ANDROID_APP_BUILD
     headers["publicPlatform"] = "android"
-    headers.update(NATIVE_DEVICE_HEADERS)
+    headers.update(lynkco_common.NATIVE_DEVICE_HEADERS)
     headers["gl_dev_id"] = device_id  # 覆盖 NATIVE_DEVICE_HEADERS 里的默认设备id
 
     url = NATIVE_BASE_URL + path
@@ -262,7 +264,7 @@ def login_by_mobile_code(device_id: str, mobile: str, verification_code: str) ->
         "appVersion": APP_VERSION,
         "hardwareDeviceId": device_id,
         "mobile": mobile,
-        "deviceModel": NATIVE_DEVICE_HEADERS.get("gl_dev_model", "sdk_gphone64_arm64"),
+        "deviceModel": lynkco_common.NATIVE_DEVICE_HEADERS.get("gl_dev_model", "sdk_gphone64_arm64"),
         "verificationCode": verification_code,
     }
     body_bytes = b"{}"
@@ -278,9 +280,9 @@ def login_by_mobile_code(device_id: str, mobile: str, verification_code: str) ->
     headers["ca_version"] = "1"
     headers["User-Agent"] = NATIVE_ANDROID_UA
     headers["appVersionCode"] = APP_VERSION
-    headers["appVersionName"] = "402030320"
+    headers["appVersionName"] = ANDROID_APP_BUILD
     headers["publicPlatform"] = "android"
-    headers.update(NATIVE_DEVICE_HEADERS)
+    headers.update(lynkco_common.NATIVE_DEVICE_HEADERS)
     headers["gl_dev_id"] = device_id  # 覆盖 NATIVE_DEVICE_HEADERS 里的默认设备id
 
     url = NATIVE_BASE_URL + path
@@ -308,7 +310,7 @@ def login_by_password(device_id: str, username: str, password_md5: str, certify_
         "password": password_md5,
         "hardwareDeviceId": hardware_device_id or device_id,
         "challenge": certify_id,
-        "deviceModel": NATIVE_DEVICE_HEADERS.get("gl_dev_model", "sdk_gphone64_arm64"),
+        "deviceModel": lynkco_common.NATIVE_DEVICE_HEADERS.get("gl_dev_model", "sdk_gphone64_arm64"),
         "username": username,
     }
     body_bytes = b"{}"
@@ -317,7 +319,7 @@ def login_by_password(device_id: str, username: str, password_md5: str, certify_
         nonce = str(uuid.uuid4())
         timestamp = str(int(time.time() * 1000))
         signature_header_items = [
-            ("X-Ca-Key", NATIVE_APP_KEY),
+            ("X-Ca-Key", lynkco_common.NATIVE_APP_KEY),
             ("X-Ca-Nonce", nonce),
             ("X-Ca-Signature-Method", "HmacSHA256"),
             ("X-Ca-Timestamp", timestamp),
@@ -337,10 +339,10 @@ def login_by_password(device_id: str, username: str, password_md5: str, certify_
         headers["certifyid"] = ""
         headers["User-Agent"] = "CA_iOS_SDK_2.0"
         headers["appVersionCode"] = APP_VERSION
-        headers["appVersionName"] = "40203073"
+        headers["appVersionName"] = IOS_APP_BUILD
         headers["publicPlatform"] = "iOS"
         headers["gl_dev_brand"] = "Apple"
-        headers["gl_app_build"] = "40203073"
+        headers["gl_app_build"] = IOS_APP_BUILD
         headers["gl_dev_platform"] = "iOS"
         headers["gl_dev_name"] = "iPhone"
         headers["gl_os_version"] = "27.0"
@@ -360,9 +362,9 @@ def login_by_password(device_id: str, username: str, password_md5: str, certify_
         headers["ca_version"] = "1"
         headers["User-Agent"] = NATIVE_ANDROID_UA
         headers["appVersionCode"] = APP_VERSION
-        headers["appVersionName"] = "402030320"
+        headers["appVersionName"] = ANDROID_APP_BUILD
         headers["publicPlatform"] = "android"
-        headers.update(NATIVE_DEVICE_HEADERS)
+        headers.update(lynkco_common.NATIVE_DEVICE_HEADERS)
         headers["gl_dev_id"] = device_id  # 覆盖 NATIVE_DEVICE_HEADERS 里的默认设备id
 
     url = NATIVE_BASE_URL + path

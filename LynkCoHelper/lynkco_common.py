@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-领克 App 相关脚本的公共基础模块：H5 / App 原生两套阿里云 API 网关签名算法
-（build_signature / build_native_signature），以及 env.json 读写辅助函数
+领克 App 相关脚本的公共基础模块：App 原生阿里云 API 网关签名算法
+（build_native_signature），以及 env.json 读写辅助函数
 （load_env_data / save_env_fields）。
 
 env.json 结构（三个子对象）：
     {
       "user": {"username": "", "password": "", "token": "", "refreshToken": "", "deviceId": "",
                 "tokenExpireAt": ""},
-      "secrets": {"h5AppKey": "", "h5AppSecret": "", "nativeAppKey": "", "nativeAppSecret": "",
-                  "nativeAppCode": "", "loginAppCode": "", "deviceImei": "", "glDevId": ""},
+      "secrets": {"nativeAppKey": "", "nativeAppSecret": "", "nativeAppCode": "",
+                  "loginAppCode": "", "deviceImei": "", "glDevId": ""},
       "notify": {"barkKey": ""}
     }
 
@@ -37,8 +37,6 @@ DEFAULT_RETRIES = 2
 
 # 密钥字段名 -> (环境变量名, env.json["secrets"] 字段名)
 _SECRET_SPECS = {
-    "H5_APP_KEY": ("LYNKCO_H5_APP_KEY", "h5AppKey"),
-    "H5_APP_SECRET": ("LYNKCO_H5_APP_SECRET", "h5AppSecret"),
     "NATIVE_APP_KEY": ("LYNKCO_NATIVE_APP_KEY", "nativeAppKey"),
     "NATIVE_APP_SECRET": ("LYNKCO_NATIVE_APP_SECRET", "nativeAppSecret"),
     "NATIVE_APP_CODE": ("LYNKCO_NATIVE_APP_CODE", "nativeAppCode"),
@@ -88,6 +86,9 @@ DEFAULT_USER_AGENT = (
 
 NATIVE_ANDROID_UA = "ALIYUN-ANDROID-UA"
 
+APP_VERSION = "4.2.7"
+ANDROID_APP_BUILD = "402071520"
+
 
 def _build_native_device_headers() -> dict:
     """设备指纹请求头，仅 gl_dev_id 来自配置，其余为固定机型字段。"""
@@ -97,16 +98,14 @@ def _build_native_device_headers() -> dict:
         "gl_dev_brand": "Google",
         "gl_dev_platform": "android",
         "gl_os_version": "33",
-        "gl_app_version": "4.2.3",
-        "gl_app_build": "402030320",
+        "gl_app_version": APP_VERSION,
+        "gl_app_build": ANDROID_APP_BUILD,
         "gl_dev_id": _get_secret("NATIVE_GL_DEV_ID"),
     }
 
 
 # 以下模块级“常量”通过 __getattr__（PEP 562）惰性求值，取值时才读取配置。
 _LAZY_ATTRS = {
-    "H5_APP_KEY": lambda: _get_secret("H5_APP_KEY"),
-    "H5_APP_SECRET": lambda: _get_secret("H5_APP_SECRET"),
     "NATIVE_APP_KEY": lambda: _get_secret("NATIVE_APP_KEY"),
     "NATIVE_APP_SECRET": lambda: _get_secret("NATIVE_APP_SECRET"),
     "NATIVE_APP_CODE": lambda: _get_secret("NATIVE_APP_CODE"),
@@ -139,46 +138,6 @@ def request_with_retry(session, method: str, url: str, *, build_headers, retries
             else:
                 print(f"[警告] 请求重试 {retries} 次后仍失败: {e}")
     raise last_exc
-
-
-def build_signature(method: str, path: str, accept: str = "*/*",
-                     content_type: str = "application/json", query: dict = None) -> dict:
-    """
-    复刻领克 H5 页面 buildApiSigature() 的签名逻辑。
-
-    待签名字符串(用 \n 连接): METHOD / Accept / "" / Content-Type / "" /
-    X-Ca-Key:.. / X-Ca-Nonce:.. / X-Ca-Signature-Method:.. / X-Ca-Timestamp:.. /
-    path(可带排序后的 query)，签名 = Base64(HMAC-SHA256(待签名字符串, appSecret))。
-    """
-    nonce = str(uuid.uuid4())
-    timestamp = str(int(time.time() * 1000))
-
-    ca_headers = {
-        "X-Ca-Key": _get_secret("H5_APP_KEY"),
-        "X-Ca-Nonce": nonce,
-        "X-Ca-Signature-Method": "HmacSHA256",
-        "X-Ca-Timestamp": timestamp,
-    }
-
-    signed_path = path
-    if query:
-        sorted_query = "&".join(f"{k}={v}" for k, v in sorted(query.items()) if v is not None and v != "")
-        if sorted_query:
-            signed_path = f"{path}?{sorted_query}"
-
-    parts = [method.upper(), accept, "", content_type, ""]
-    for k, v in ca_headers.items():
-        parts.append(f"{k}:{v}")
-    parts.append(signed_path)
-
-    string_to_sign = "\n".join(parts)
-    digest = hmac.new(_get_secret("H5_APP_SECRET").encode(), string_to_sign.encode(), hashlib.sha256).digest()
-    signature = base64.b64encode(digest).decode()
-
-    result = dict(ca_headers)
-    result["X-Ca-Signature-Headers"] = "X-Ca-Key,X-Ca-Timestamp,X-Ca-Nonce,X-Ca-Signature-Method"
-    result["X-Ca-Signature"] = signature
-    return result
 
 
 def _format_gmt_date() -> str:
