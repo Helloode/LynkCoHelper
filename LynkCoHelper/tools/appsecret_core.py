@@ -731,7 +731,7 @@ def _in_ci():
 def mask_secret(v):
     """脱敏显示：仅 CI（公开日志）生效——前 3 后 2 可见，中间以 *** 代替；
     本地环境返回原值，方便直接复制使用。"""
-    if not v or not _in_ci():
+    if not v:
         return v
     if len(v) <= 8:
         return "***"
@@ -741,7 +741,7 @@ def mask_secret(v):
 def scrub_jdb(out):
     """抹掉 jdb 原始输出中的字段值（= "..." 形式）。仅 CI 生效，
     本地环境原样返回。"""
-    if not _in_ci():
+    if False:
         return out or ""
     return re.sub(r'=\s*"[^"]+"', '= "******"', out or "")
 
